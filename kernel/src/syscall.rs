@@ -212,7 +212,7 @@ extern "C" fn dispatch(a0: u64, a1: u64, a2: u64, _a3: u64, nr: u64) -> i64 {
         SYS_KILL => sys_kill(a0),
         SYS_ENDPOINT => sys_endpoint(),
         SYS_CHECK => sys_check(),
-        SYS_MEM_CREATE => sys_mem_create(a0),
+        SYS_MEM_CREATE => sys_mem_create(a0, a1),
         SYS_MAP => sys_map(a0, a1, a2, _a3),
         SYS_UNMAP => sys_unmap(a0),
         _ => E_BADCALL,
@@ -573,7 +573,7 @@ fn sys_recv(ep_slot: u64, words_ptr: u64) -> i64 {
 /// No special authority: memory a process allocates is owned by that process,
 /// charged to its subtree and freed when it dies, so the only limit that
 /// matters is already enforced by the ownership tree.
-fn sys_mem_create(pages: u64) -> i64 {
+fn sys_mem_create(pages: u64, paged: u64) -> i64 {
     let proc = match caller() {
         Some(p) => p,
         None => return E_BADHANDLE,
@@ -581,23 +581,33 @@ fn sys_mem_create(pages: u64) -> i64 {
     if pages == 0 || pages > 4096 {
         return E_NOSPACE;
     }
-    let obj = match crate::vm::alloc_object_for(proc, pages as u32) {
-        Ok(o) => o,
-        Err(_) => return E_NOSPACE,
-    };
-    // Zero it before anyone can see it: memory that has been elsewhere must
-    // not arrive carrying what was there.
-    let (phys, n) = {
-        let g = GRAPH.lock();
-        match g.body(obj) {
-            Some(b) => (b.phys_base, b.pages as usize),
-            None => return E_BADHANDLE,
+    let obj = if paged != 0 {
+        // Nothing to zero: nothing exists yet. Each page is zeroed on the fault
+        // that brings it into being.
+        match crate::vm::alloc_paged_object_for(proc, pages as u32) {
+            Ok(o) => o,
+            Err(_) => return E_NOSPACE,
         }
+    } else {
+        let obj = match crate::vm::alloc_object_for(proc, pages as u32) {
+            Ok(o) => o,
+            Err(_) => return E_NOSPACE,
+        };
+        // Zero it before anyone can see it: memory that has been elsewhere must
+        // not arrive carrying what was there.
+        let (phys, n) = {
+            let g = GRAPH.lock();
+            match g.body(obj) {
+                Some(b) => (b.phys_base, b.pages as usize),
+                None => return E_BADHANDLE,
+            }
+        };
+        // SAFETY: frames just allocated for this object, reachable only here.
+        unsafe {
+            core::ptr::write_bytes((crate::paging::hhdm() + phys) as *mut u8, 0, n * 4096);
+        }
+        obj
     };
-    // SAFETY: frames just allocated for this object, reachable only from here.
-    unsafe {
-        core::ptr::write_bytes((crate::paging::hhdm() + phys) as *mut u8, 0, n * 4096);
-    }
     let mut g = GRAPH.lock();
     match g.grant(proc, obj, Rights::ALL) {
         Ok(slot) => slot as i64,

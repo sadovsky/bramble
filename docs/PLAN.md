@@ -252,19 +252,20 @@ size) and a user buffer that is too small. Both are engineering, not design.
 
 Not part of v1. Listed so the v1 design does not paint itself out of them.
 
-1. ~~**Lazy mapping and the per-space range index**~~ — **done**, see the build
-   log below. Demand-zero and copy-on-write still need non-contiguous memory
-   objects, which is separate work.
-2. **Async notifications** as a bitmask on `Endpoint`, so an interrupt can
+1. ~~**Lazy mapping and the per-space range index**~~ — **done**.
+2. ~~**Non-contiguous memory objects**~~ — **done**: demand allocation and
+   shared memory. Copy-on-write still needs per-frame reference counts.
+3. **Async notifications** as a bitmask on `Endpoint`, so an interrupt can
    signal a userspace driver without a blocked receiver.
-3. **Chunked slab growth** from the frame allocator.
-4. **SMP**: `Cpu` nodes with their own locks, cross-CPU TLB shootdown, thread
+4. **Chunked slab growth** from the frame allocator.
+5. **SMP**: `Cpu` nodes with their own locks, cross-CPU TLB shootdown, thread
    migration as `retarget_src` on a `Ready` edge, and the global lock
    retreating to structural mutations. The lock audit from design section
    3.8 is the entry criterion.
-5. **Reparenting and orphan semantics** as a distinct edge kind if `Owns` as
+6. **Reparenting and orphan semantics** as a distinct edge kind if `Owns` as
    parentage proves too rigid.
-6. **Persistence**, only after a separate design document. Do not start it
+7. **Copy-on-write**, which needs a reference count per frame.
+8. **Persistence**, only after a separate design document. Do not start it
    as a weekend project.
 
 ---
@@ -851,3 +852,53 @@ contiguously; only the page-table work is deferred. Demand-*allocation* needs a
 already lists as post-v1 and which changes the shape of a node rather than
 adding an index. Copy-on-write needs the same thing plus a reference count on
 the frames. Both are the next step, not this one.
+
+### Phase 9b: non-contiguous memory, demand allocation and shared memory — **done**
+
+A `MemoryObject` could only describe a *contiguous* physical range, which
+DESIGN 4.1 flagged as a v1 simplification. It can now describe pages that are
+scattered, or that do not exist yet.
+
+**The shape change.** A `PAGED` object carries `frames_phys`, the address of a
+table with one physical address per page and zero where a page has never been
+touched. That table is not in the graph, for the same reason page tables are
+not: it is a dense array indexed by position, and a node per page would be a
+million nodes saying nothing. The graph records *where it is* so the reaper can
+walk it, exactly as it does for page tables.
+
+Reclamation gains `Reclaim::PagedMemory`, and the reaper walks the table
+freeing whichever pages were ever made real, then the table itself.
+
+**Demand allocation.** `fault_in` now allocates the frame on the fault that
+first touches a page, zeroes it, and records it in the table. The previous phase
+deferred only the page-table work; this defers the memory.
+
+**Shared memory falls out.** Two processes mapping the same paged object read
+the same table entry, so they get the same frame. Nothing else was needed:
+
+```
+[share] reserved 64 pages, made 2 of them real, wrote to both
+[share] granted the peer read, write and map on that memory, as its slot 3
+[peer]  mapped the same memory at 0x66000000, my own choice of address
+[peer]  read 0x5eed0001 and 0x5eed0002, wrote 0x5eedbeef back
+[share] and what the peer wrote is visible here: 0x5eedbeef
+vm:     6 faults across both processes for a 64-page shared region
+```
+
+Six faults: three pages, two processes, two different virtual addresses. The
+*object* is the shared thing; the address is not, and each process chose its
+own.
+
+Worth being precise about what makes this shared. There is no shared-memory
+key, no path, no identifier the peer could have guessed or brute-forced. It can
+reach those pages because an edge was created saying it may. Take the edge away
+and there is no name left to try.
+
+**Invariant I5 extended.** For a paged object the expected frame comes from the
+table rather than from `phys_base + offset`, and a page with no frame must have
+no page-table entry. The other direction is unchanged and still absolute: an
+entry no mapping authorises is a violation, with no exception.
+
+**Still missing:** copy-on-write, which needs a reference count per frame so a
+shared page can be split on write. That is a change to the frame allocator
+rather than to the graph, and it is the next thing in this area.

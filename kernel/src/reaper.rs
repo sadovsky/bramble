@@ -55,6 +55,24 @@ pub fn step(report: &mut ReapReport) -> bool {
                         }
                     }
                 }
+                Reclaim::PagedMemory { table_phys, table_pages, pages } => {
+                    // Walk the table and give back whichever pages were ever
+                    // touched. The graph knows the object had these pages; only
+                    // the table knows which of them were made real.
+                    if let Some(fa) = FRAMES.lock().as_mut() {
+                        for i in 0..pages as u64 {
+                            // SAFETY: the table belongs to an object being
+                            // reaped, and `i` is inside it.
+                            let frame = unsafe { crate::vm::frame_entry(table_phys, i) };
+                            if frame != 0 {
+                                fa.free_contiguous(frame, 1);
+                                report.frames_returned += 1;
+                            }
+                        }
+                        fa.free_contiguous(table_phys, table_pages as usize);
+                        report.frames_returned += table_pages as u64;
+                    }
+                }
                 Reclaim::PageTables { pml4_phys } => {
                     if let Some(fa) = FRAMES.lock().as_mut() {
                         // SAFETY: the address space is unreachable and nothing

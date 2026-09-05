@@ -38,12 +38,17 @@ extern "C" fn main() -> ! {
     println!();
     println!("[lazy] up");
 
-    let mem = mem_create(PAGES);
+    let mem = mem_create(PAGES, true);
     if mem < 0 {
         println!("[lazy] mem_create failed: {}", abi::error_name(mem));
         exit(1);
     }
-    println!("[lazy] allocated {} pages ({} KiB) in slot {}", PAGES, PAGES * 4, mem);
+    println!(
+        "[lazy] reserved {} pages ({} KiB) in slot {}: no frames allocated yet",
+        PAGES,
+        PAGES * 4,
+        mem
+    );
 
     let r = map(mem as u32, BASE, abi::P_READ | abi::P_WRITE, true);
     if r != 0 {

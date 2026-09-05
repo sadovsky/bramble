@@ -307,6 +307,11 @@ extern "C" fn kmain() -> ! {
     dump::dump_graph();
 
     println!();
+    selftest::shared_memory(modules);
+    println!();
+    dump::dump_graph();
+
+    println!();
     cprintln!(fb::ACCENT, "phase 9 complete. halting.");
     halt_forever();
 }

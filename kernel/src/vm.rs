@@ -109,6 +109,65 @@ pub fn alloc_object(owner: Ref<Root>, pages: u32) -> Result<Ref<MemoryObject>, V
     }
 }
 
+/// Allocate a **paged** object: `pages` of memory that do not exist yet.
+///
+/// Only the frame table is allocated now. Each page's frame is found on the
+/// fault that first touches it, which is what makes a mapping of a large region
+/// nearly free until it is used.
+pub fn alloc_paged_object_for(
+    owner: Ref<Process>,
+    pages: u32,
+) -> Result<Ref<MemoryObject>, VmError> {
+    let table_pages = ((pages as u64 * 8).div_ceil(PAGE_SIZE)) as u32;
+    let mut g = GRAPH.lock();
+    let mut fa = FRAMES.lock();
+    let fa = fa.as_mut().ok_or(VmError::NoAllocator)?;
+    let table = fa
+        .alloc_contiguous(table_pages as usize)
+        .ok_or(VmError::Paging(MapError::OutOfFrames))?;
+    // SAFETY: frames just allocated, reachable only from here. A zero entry
+    // means "not yet backed", so the table must start zeroed.
+    unsafe {
+        core::ptr::write_bytes(
+            (paging::hhdm() + table) as *mut u8,
+            0,
+            table_pages as usize * PAGE_SIZE as usize,
+        )
+    };
+    match g.create_under_process(
+        owner,
+        MemoryObject {
+            frames_phys: table,
+            frames_pages: table_pages,
+            pages,
+            flags: MemFlags::PAGED,
+            ..MemoryObject::ZERO
+        },
+    ) {
+        Ok(m) => Ok(m),
+        Err(e) => {
+            fa.free_contiguous(table, table_pages as usize);
+            Err(VmError::Graph(e))
+        }
+    }
+}
+
+/// Read one entry of a paged object's frame table.
+///
+/// # Safety
+/// `table` must be the frame table of a live paged object and `index` inside it.
+pub unsafe fn frame_entry(table: u64, index: u64) -> u64 {
+    unsafe { ((paging::hhdm() + table) as *const u64).add(index as usize).read() }
+}
+
+/// Write one entry of a paged object's frame table.
+///
+/// # Safety
+/// As `frame_entry`.
+pub unsafe fn set_frame_entry(table: u64, index: u64, frame: u64) {
+    unsafe { ((paging::hhdm() + table) as *mut u64).add(index as usize).write(frame) }
+}
+
 /// Map a slice of a memory object into an address space.
 ///
 /// The edge comes first, because creating it is what performs the overlap check
@@ -194,7 +253,7 @@ pub static LOOKUP_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 pub fn fault_in(addr: u64) -> bool {
     use core::sync::atomic::Ordering;
     let page = addr & !(PAGE_SIZE - 1);
-    let (pml4, paddr, prot) = {
+    let (pml4, body, index, prot) = {
         let g = GRAPH.lock();
         let t: Ref<Thread> = match g.typed(crate::sched::current_locked(&g)) {
             Some(t) => t,
@@ -226,22 +285,50 @@ pub fn fault_in(addr: u64) -> bool {
             Some(o) => o,
             None => return false,
         };
-        let base = match g.body(obj) {
-            Some(b) => b.phys_base,
+        let body = match g.body(obj) {
+            Some(b) => *b,
             None => return false,
         };
         let index = (page - attr.vaddr) / PAGE_SIZE + attr.off_pages as u64;
+        if index >= body.pages as u64 {
+            return false;
+        }
         let pml4 = match g.body(space) {
             Some(b) => b.pml4_phys,
             None => return false,
         };
-        (pml4, base + index * PAGE_SIZE, attr.prot)
+        (pml4, body, index, attr.prot)
     };
 
     let mut fa = FRAMES.lock();
     let fa = match fa.as_mut() {
         Some(f) => f,
         None => return false,
+    };
+
+    // A contiguous object already knows the frame. A paged one may have to
+    // find one now: this is where memory actually comes into existence, and
+    // where two processes mapping the same object end up sharing it, because
+    // they read the same table entry.
+    let paddr = if body.is_paged() {
+        // SAFETY: the table belongs to a live object and `index` is in range.
+        let existing = unsafe { frame_entry(body.frames_phys, index) };
+        if existing != 0 {
+            existing
+        } else {
+            let frame = match fa.alloc() {
+                Some(f) => f,
+                None => return false,
+            };
+            // SAFETY: a fresh frame nothing else can reach yet. Memory handed
+            // to a process must not arrive carrying what was last in it.
+            unsafe { core::ptr::write_bytes((paging::hhdm() + frame) as *mut u8, 0, 4096) };
+            // SAFETY: as above.
+            unsafe { set_frame_entry(body.frames_phys, index, frame) };
+            frame
+        }
+    } else {
+        body.phys_base + index * PAGE_SIZE
     };
     // SAFETY: a page-table root this kernel built, and one page inside a range
     // the graph says this address space may use.
@@ -292,10 +379,27 @@ pub fn check_page_tables(g: &Graph) -> Result<(), I5> {
             let edge = g.edge(eid).expect("live edge");
             let attr = MapsAttr::decode(edge.data);
             let obj: Ref<MemoryObject> = g.typed(edge.dst).expect("memory object");
-            let base = g.body(obj).expect("body").phys_base;
+            let body = *g.body(obj).expect("body");
             for i in 0..attr.len_pages as u64 {
                 let vaddr = attr.vaddr + i * PAGE_SIZE;
-                let want = base + (attr.off_pages as u64 + i) * PAGE_SIZE;
+                let index = attr.off_pages as u64 + i;
+                // For a paged object the expected frame is whatever the table
+                // says, which is the whole difference: the graph knows the
+                // object has this page, not where it is.
+                let want = if body.is_paged() {
+                    // SAFETY: the table belongs to a live object in range.
+                    unsafe { frame_entry(body.frames_phys, index) }
+                } else {
+                    body.phys_base + index * PAGE_SIZE
+                };
+                if body.is_paged() && want == 0 {
+                    // Not backed yet, so there had better be no entry either.
+                    // SAFETY: reading page tables of a space this kernel owns.
+                    if unsafe { paging::translate(pml4, vaddr) }.is_some() {
+                        return Err(I5::UnknownEntry { space: node, vaddr, phys: 0 });
+                    }
+                    continue;
+                }
                 // SAFETY: reading page tables of a space this kernel owns.
                 match unsafe { paging::translate(pml4, vaddr) } {
                     // A lazy mapping is allowed to have no entry yet: the edge
@@ -364,12 +468,18 @@ fn covered(g: &Graph, space: NodeId, vaddr: u64, phys: u64) -> bool {
             Some(o) => o,
             None => continue,
         };
-        let base = match g.body(obj) {
-            Some(b) => b.phys_base,
+        let body = match g.body(obj) {
+            Some(b) => *b,
             None => continue,
         };
-        let page = (vaddr - attr.vaddr) / PAGE_SIZE;
-        if base + (attr.off_pages as u64 + page) * PAGE_SIZE == phys {
+        let index = attr.off_pages as u64 + (vaddr - attr.vaddr) / PAGE_SIZE;
+        let want = if body.is_paged() {
+            // SAFETY: the table belongs to a live object in range.
+            unsafe { frame_entry(body.frames_phys, index) }
+        } else {
+            body.phys_base + index * PAGE_SIZE
+        };
+        if want != 0 && want == phys {
             return true;
         }
     }

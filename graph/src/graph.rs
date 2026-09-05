@@ -151,6 +151,10 @@ pub enum Reclaim {
     /// Frames a memory object described. Device and pinned regions are
     /// reported too, with their flags, so the caller can decline to free them.
     Frames { phys: u64, pages: u32, flags: MemFlags },
+    /// A non-contiguous object: a table of per-page frames, and the table
+    /// itself. The graph does not know which entries are filled in, only where
+    /// to look, so the caller walks it.
+    PagedMemory { table_phys: u64, table_pages: u32, pages: u32 },
     /// The page tables of an address space, root included.
     PageTables { pml4_phys: u64 },
 }
@@ -1177,6 +1181,11 @@ impl Graph {
             Some(NodeKind::MemoryObject) => {
                 let r: Ref<MemoryObject> = Ref::from_raw(id);
                 match self.body(r) {
+                    Some(b) if b.is_paged() => Reclaim::PagedMemory {
+                        table_phys: b.frames_phys,
+                        table_pages: b.frames_pages,
+                        pages: b.pages,
+                    },
                     Some(b) => {
                         Reclaim::Frames { phys: b.phys_base, pages: b.pages, flags: b.flags }
                     }

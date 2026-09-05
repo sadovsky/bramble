@@ -999,3 +999,48 @@ fn a_full_range_index_reports_it_rather_than_overflowing() {
     assert!(matches!(overflow, Err(GraphError::TooManyMappings)));
     check(&g);
 }
+
+#[test]
+fn a_paged_object_reports_its_table_rather_than_a_range() {
+    let mut g = empty();
+    let root = g.create_root().unwrap();
+    let p = g.create_under_root(root, Process::ZERO).unwrap();
+
+    // A contiguous object knows where its frames are; the reaper can free them
+    // from the node alone.
+    g.create_under_process(p, MemoryObject { phys_base: 0x7000, pages: 3, ..MemoryObject::ZERO })
+        .unwrap();
+    // A paged one does not: its pages are wherever they were allocated, listed
+    // in a table the graph only records the address of.
+    g.create_under_process(
+        p,
+        MemoryObject {
+            frames_phys: 0xE000,
+            frames_pages: 1,
+            pages: 64,
+            flags: MemFlags::PAGED,
+            ..MemoryObject::ZERO
+        },
+    )
+    .unwrap();
+    check(&g);
+
+    g.begin_delete(p.id()).unwrap();
+    let mut contiguous = Vec::new();
+    let mut paged = Vec::new();
+    loop {
+        match g.reap_step() {
+            ReapStep::Idle => break,
+            ReapStep::Freed { reclaim: Reclaim::Frames { phys, pages, .. }, .. } => {
+                contiguous.push((phys, pages))
+            }
+            ReapStep::Freed {
+                reclaim: Reclaim::PagedMemory { table_phys, table_pages, pages }, ..
+            } => paged.push((table_phys, table_pages, pages)),
+            _ => {}
+        }
+    }
+    assert_eq!(contiguous, [(0x7000u64, 3u32)]);
+    assert_eq!(paged, [(0xE000u64, 1u32, 64u32)]);
+    check(&g);
+}

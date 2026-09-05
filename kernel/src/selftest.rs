@@ -998,3 +998,70 @@ pub fn lazy_mapping(modules: &[&limine::file::File]) {
     assert_eq!(before, after, "the lazy program left something behind");
     cprintln!(fb::ACCENT, "vm:   512 pages mapped, 3 pages realised, nothing leaked");
 }
+
+/// Phase 9b: two processes sharing memory that only one of them created, and
+/// that neither of them could have named.
+pub fn shared_memory(modules: &[&limine::file::File]) {
+    let (root, console, root_id) = {
+        let g = GRAPH.lock();
+        let boot = crate::state::BOOT.lock();
+        (g.root().expect("root"), boot.console, boot.root)
+    };
+    let before = census();
+    let boot = crate::sched::adopt_boot_thread(root).expect("boot thread");
+
+    let elf = find_module(modules, "share").expect("the share module is missing");
+    let faults_before = crate::vm::LAZY_FAULTS.load(AtomicOrdering::Relaxed);
+    x86_64::instructions::interrupts::enable();
+
+    let proc = crate::proc::spawn(
+        crate::proc::Owner::Root(root),
+        elf,
+        &[(console, Rights::READ.union(Rights::WRITE)), (root_id, Rights::LOOKUP)],
+    )
+    .unwrap_or_else(|e| panic!("could not spawn share: {}", e.describe()));
+    crate::proc::start(proc).expect("start share");
+
+    let deadline = crate::time::ticks() + 6000;
+    let mut rounds = 0u32;
+    while GRAPH.lock().is_live(proc.id()) {
+        crate::sched::yield_now();
+        rounds += 1;
+        if rounds.is_multiple_of(32) {
+            reaper::drain();
+            state::assert_consistent("while the sharing programs ran");
+            assert!(crate::time::ticks() < deadline, "the sharing programs never finished");
+        }
+    }
+    x86_64::instructions::interrupts::disable();
+    reaper::drain();
+
+    let served = crate::vm::LAZY_FAULTS.load(AtomicOrdering::Relaxed) - faults_before;
+    println!("vm:   {} faults across both processes for a 64-page shared region", served);
+    // Three pages are ever touched, by two processes at two different virtual
+    // addresses: three frames, six faults. Anything close to sixty-four would
+    // mean the pages were being allocated rather than shared.
+    assert!(served >= 3, "expected at least three faults, saw {}", served);
+    assert!(
+        served <= 16,
+        "expected a handful of faults for three shared pages, saw {}",
+        served
+    );
+
+    {
+        let mut g = GRAPH.lock();
+        g.begin_delete(boot.id()).expect("delete boot thread");
+        if let Some(cpu) = g.typed::<Cpu>(crate::state::cpu0()) {
+            if let Some(b) = g.body_mut(cpu) {
+                b.current = NodeId::NULL;
+            }
+        }
+    }
+    reaper::drain();
+    let after = census();
+    assert_eq!(before, after, "the sharing programs left something behind");
+    cprintln!(
+        fb::ACCENT,
+        "vm:   two processes shared memory neither of them could name"
+    );
+}

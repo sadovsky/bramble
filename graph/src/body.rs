@@ -281,6 +281,15 @@ impl MemFlags {
     pub const DEVICE: MemFlags = MemFlags(1 << 0);
     /// Kernel-pinned: the reaper must not reclaim the frames.
     pub const PINNED: MemFlags = MemFlags(1 << 1);
+    /// The object's pages are **not contiguous**, and may not exist yet.
+    ///
+    /// `phys_base` means nothing for such an object. Instead `frames_phys`
+    /// points at a table of one physical address per page, zero where the page
+    /// has never been touched. That table is not in the graph, for the same
+    /// reason page tables are not: it is a dense array indexed by position, and
+    /// a node per page would be a million nodes saying nothing (DESIGN 4.4).
+    /// The graph records where it is so the reaper can walk it.
+    pub const PAGED: MemFlags = MemFlags(1 << 2);
     pub const fn contains(self, o: MemFlags) -> bool {
         self.0 & o.0 == o.0
     }
@@ -289,23 +298,35 @@ impl MemFlags {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct MemoryObject {
+    /// First frame, for a contiguous object. Meaningless when `PAGED`.
     pub phys_base: u64,
+    /// Frame table, for a `PAGED` object: `pages` entries of one physical
+    /// address each, zero where the page is not yet backed.
+    pub frames_phys: u64,
     pub pages: u32,
     pub flags: MemFlags,
     /// Hot-hop cache: number of `Maps` in-edges (invariant I9).
     pub map_count: u32,
-    pub _pad: u32,
+    /// How many frames the frame table itself occupies.
+    pub frames_pages: u32,
 }
 
 impl NodeBody for MemoryObject {
     const KIND: NodeKind = NodeKind::MemoryObject;
     const ZERO: Self = MemoryObject {
         phys_base: 0,
+        frames_phys: 0,
         pages: 0,
         flags: MemFlags::NONE,
         map_count: 0,
-        _pad: 0,
+        frames_pages: 0,
     };
+}
+
+impl MemoryObject {
+    pub const fn is_paged(&self) -> bool {
+        self.flags.contains(MemFlags::PAGED)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

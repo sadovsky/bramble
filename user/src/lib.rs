@@ -122,9 +122,12 @@ pub fn endpoint_create() -> i64 {
 }
 
 /// Allocate zeroed memory owned by this process.
-pub fn mem_create(pages: u64) -> i64 {
+///
+/// `paged` asks for memory whose pages are allocated as they are first touched
+/// rather than up front, so a large region costs almost nothing until used.
+pub fn mem_create(pages: u64, paged: bool) -> i64 {
     // SAFETY: no pointer arguments.
-    unsafe { syscall(abi::SYS_MEM_CREATE, pages, 0, 0, 0) }
+    unsafe { syscall(abi::SYS_MEM_CREATE, pages, u64::from(paged), 0, 0) }
 }
 
 /// Map memory into this process's own address space.

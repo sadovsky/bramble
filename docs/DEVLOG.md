@@ -1669,3 +1669,125 @@ graph, maintained by the operations that change the graph, and verified against
 the graph by a checker that runs on every boot. What the design refused to do
 was let any of them become a second, independent truth — and nine phases in,
 none of them has.
+
+---
+
+## Entry 11 — Phase 9b: memory that does not exist until you look at it
+
+**Milestone: two processes sharing memory that neither of them could have
+named, at two different addresses, with three pages ever made real out of
+sixty-four.**
+
+### The concepts
+
+**Demand allocation.** The previous phase deferred the *page-table* work: the
+frames were allocated up front and the hardware learned about them lazily. Real
+demand paging defers the memory itself. A program asks for sixty-four pages,
+gets a promise, and a page becomes real the first time it is touched.
+
+Almost every program does this. A process asks for a large heap and uses a
+fraction of it; a stack is reserved at its maximum and grows into. Allocating
+what is promised rather than what is used would waste most of a machine.
+
+**Why this needed a change to a node.** A `MemoryObject` described a
+**contiguous** physical range: a base address and a count. That is fine when the
+memory is allocated in one go. It cannot describe pages that arrive one at a
+time from wherever the allocator had room, because they will not be next to each
+other.
+
+So the shape of the node had to change. A paged object now carries the address
+of a **frame table** — one physical address per page, zero where the page has
+never been touched.
+
+### Where that table lives, and why not in the graph
+
+This is the interesting decision, and the design had already settled the
+principle in section 4.4, when it explained why free memory is a bitmap:
+
+> A set is not a relationship. Would be a million edges.
+
+The same argument applies. A frame table is a dense array indexed by position:
+page 7 of this object is at *this* address. That is not a relationship between
+two objects, it is a lookup keyed by an integer. Modelling it as nodes and edges
+would mean a node per page, which for a 64-page object is 64 nodes that say
+nothing except "page 7 is here" — and that is what an array element already
+says, in eight bytes instead of a hundred.
+
+So the table sits outside the graph, and the graph records where it is. Exactly
+what it already does for page tables. And it comes with the same obligation: the
+reaper must be told how to free it, which is one more `Reclaim` variant, and
+invariant I5 must know how to check it, which is one more branch.
+
+Nine phases in, the pattern is settled and it is worth naming plainly:
+**relationships go in the graph; dense arrays indexed by position do not.** The
+graph records where the array is, the operations that change the graph maintain
+it, and the checker verifies the two agree. Free frames, page tables, handle
+tables, the range index and now frame tables all sit on the same side of that
+line, for the same reason.
+
+### Sharing, which took no extra code
+
+Once pages come from a table, two processes mapping the same object read the
+same table entry and get the same frame. Shared memory was not implemented; it
+happened.
+
+```
+[share] reserved 64 pages, made 2 of them real, wrote to both
+[share] granted the peer read, write and map on that memory, as its slot 3
+[peer]  mapped the same memory at 0x66000000, my own choice of address
+[peer]  read 0x5eed0001 and 0x5eed0002, wrote 0x5eedbeef back
+[share] and what the peer wrote is visible here: 0x5eedbeef
+vm:     6 faults across both processes for a 64-page shared region
+```
+
+Six faults. Three pages, touched by two processes, at two different virtual
+addresses. The object is the shared thing; the address is not, and each process
+picked its own.
+
+### How this differs from every other shared memory you have used
+
+In Unix, shared memory has a **name**. `shm_open("/myregion")`, or a System V
+key, or a path in `/dev/shm`. The name is how you find it, and the name is in a
+namespace that other processes can also see. Whether they may *use* it is a
+separate question answered by permission bits somewhere else.
+
+That separation is the problem. Anyone who can name it can attempt it. Access
+control is a second mechanism bolted alongside the naming mechanism, and the two
+have to be kept in agreement by whoever configures them.
+
+Here the peer reaches those pages because **an edge was created saying it may**,
+and for no other reason. There is no key it could have guessed, no path it could
+have opened, no namespace to enumerate. Take the edge away and there is nothing
+left to try — not "permission denied", but no way to express the request.
+
+That is the same property as phase 5's console capability, and phase 6's
+endpoint, and phase 7's revocation. It keeps showing up because it is the one
+idea the whole design is made of: **authority is a thing you hold, and if you
+were not handed it, it is not merely forbidden, it is unsayable.**
+
+### Being honest about what is still missing
+
+Copy-on-write. Two processes sharing a page and one of them writing should get
+its own copy, and that needs a reference count on each frame so the kernel knows
+whether a page is shared before it splits it.
+
+That is a change to the frame allocator, not to the graph — the graph already
+says who has what — which is a decent sign that the shape is right: the next
+feature needs work in the place the feature actually lives.
+
+---
+
+## What is next
+
+The remaining post-v1 list, in the order I would take it:
+
+1. **Async notifications** — a bitmask on `Endpoint`, so an interrupt can signal
+   a userspace driver with no thread blocked waiting.
+2. **Chunked arena growth**, removing the fixed caps the design accepted for v1.
+3. **SMP**, where both recorded debts come due at once: the 8259 interrupt
+   controller that does not scale past one core, and the `swapgs` pairing that
+   comes back with per-cpu state.
+4. **Copy-on-write**, once frames are reference counted.
+
+Persistence stays where the design put it: behind its own document, and not as
+a weekend project.
