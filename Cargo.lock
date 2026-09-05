@@ -22,6 +22,7 @@ version = "0.1.0"
 name = "bramble-kernel"
 version = "0.1.0"
 dependencies = [
+ "bramble-graph",
  "limine",
  "spin",
  "x86_64",

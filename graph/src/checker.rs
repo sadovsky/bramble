@@ -300,8 +300,7 @@ impl Checker {
             }
             let p: Ref<Process> = g.typed(node).expect("process");
             let body = g.body(p).expect("body");
-            for slot in 1..HANDLE_SLOTS {
-                let ei = body.handles[slot];
+            for (slot, &ei) in body.handles.iter().enumerate().skip(1) {
                 if ei == 0 {
                     continue;
                 }

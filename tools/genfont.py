@@ -47,12 +47,12 @@ for cp, glyph in rows:
     print(f"    [{body}], // {cp:#04x} '{ch}'")
 print("];")
 print()
-print("""/// Glyph rows for `c`, or the rows for a filled box if it is out of range.
+print("""/// Glyph rows for `c`, falling back to a question mark outside the range.
 #[inline]
 pub fn glyph(c: u8) -> &'static [u8; GLYPH_H] {
-    if c < FIRST_CHAR || c > LAST_CHAR {
-        &FONT[('?' as u8 - FIRST_CHAR) as usize]
-    } else {
+    if (FIRST_CHAR..=LAST_CHAR).contains(&c) {
         &FONT[(c - FIRST_CHAR) as usize]
+    } else {
+        &FONT[(b'?' - FIRST_CHAR) as usize]
     }
 }""")

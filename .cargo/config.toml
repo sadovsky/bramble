@@ -7,3 +7,10 @@ rustflags = [
     "-C", "relocation-model=static",
     "-C", "code-model=kernel",
 ]
+
+# The default build target is bare metal, so host-side tests need to say
+# otherwise. These aliases are the supported way to run them.
+[alias]
+ktest = "test --target x86_64-unknown-linux-gnu -p bramble-graph"
+kbench = "test --release --target x86_64-unknown-linux-gnu -p bramble-graph -- --nocapture bench_ fast_path"
+kclippy = "clippy --target x86_64-unknown-linux-gnu -p bramble-graph --all-targets"

@@ -348,3 +348,52 @@ edge it shadows.
 The lesson is the one the design predicted, and it is worth restating: the
 graph's own structure was never the problem. Every bug was a cache, and the
 checker found all three within seconds of existing.
+
+### Phase 2: physical memory and the graph in the kernel — **done**
+
+A bitmap frame allocator over the Limine memory map, carving its own storage
+out of the first usable region and marking it used. The graph itself lives in
+a single `IrqLock<Graph>` static: the lock disables interrupts while held,
+because the timer and the serial receiver will both mutate the graph from
+interrupt context in phase 4.
+
+Boot creates the root, `cpu0`, a `Device` for the serial console, and a
+`MemoryObject` for every region of physical memory that is spoken for: the
+kernel image, the framebuffer, the frame bitmap, and each boot module. Named
+edges hang off the root for each. Then the in-kernel checker runs and the whole
+graph is printed over serial.
+
+`tools/graphdump.py` reads that block out of the serial log, re-verifies the
+structural invariants from outside the kernel, and renders it with Graphviz.
+`scripts/smoke.sh` now does this on every boot, so a disagreement between the
+in-kernel checker and the offline one fails the build.
+
+Measured at the milestone: 6 nodes, 10 edges, 123135 frames total with 117850
+free, checker clean in kernel and on the host.
+
+**What this phase caught.** `Graph::EMPTY` was not actually all zeroes:
+`Process::ZERO` set `next_slot_hint` to 1, which put all 429 KiB of arenas into
+`.data` and into the kernel image instead of `.bss`. The claim that the graph
+costs nothing before the allocator runs was quietly false. Fixed by treating a
+zero hint as "scan from the start", and `scripts/build-iso.sh` now fails the
+build if `.data` exceeds 64 KiB so it cannot regress. Sections are now 288
+bytes of `.data` against 465 KiB of `.bss`.
+
+**Risk retired:** bootstrapping order. Nothing needed a frame before the bitmap
+existed, and nothing needed a node before the graph was declared, because the
+graph needs no construction at all.
+
+## Running it
+
+```
+cargo ktest                 # graph crate tests, on the host
+cargo kbench                # the fast-path measurements
+./scripts/build-iso.sh      # build the kernel and a UEFI ISO
+./scripts/qemu.sh           # boot it, serial on stdout
+./scripts/smoke.sh          # boot headless, capture serial + screenshot + graph
+./scripts/check.sh          # everything above that can fail a commit
+```
+
+`scripts/smoke.sh` writes `build/serial.log`, `build/screen.png` and
+`build/graph.png`. There is no KVM in the usual container, so QEMU runs under
+TCG.

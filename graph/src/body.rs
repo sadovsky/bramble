@@ -118,13 +118,17 @@ impl NodeBody for Cpu {
 pub struct Process {
     /// slot -> edge slab index of a `Holds` edge; 0 means the slot is empty.
     pub handles: [u32; HANDLE_SLOTS],
+    /// Where to resume the search for a free slot. Zero means "from the
+    /// start"; slot 0 is the null handle and is never allocated. Keeping the
+    /// resting value at zero is what keeps `Graph::EMPTY` all-zero, and so
+    /// what keeps the whole graph in `.bss` instead of the kernel image.
     pub next_slot_hint: u32,
     pub exit_code: i32,
 }
 
 impl NodeBody for Process {
     const KIND: NodeKind = NodeKind::Process;
-    const ZERO: Self = Process { handles: [0; HANDLE_SLOTS], next_slot_hint: 1, exit_code: 0 };
+    const ZERO: Self = Process { handles: [0; HANDLE_SLOTS], next_slot_hint: 0, exit_code: 0 };
 }
 
 impl core::fmt::Debug for Process {

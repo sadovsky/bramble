@@ -18,6 +18,19 @@ fi
 cargo build -p bramble-kernel "${CARGO_FLAGS[@]}"
 KERNEL="target/x86_64-unknown-none/$PROFILE/bramble"
 
+# The whole graph is meant to live in .bss: Graph::EMPTY is all zeroes, which
+# is what lets it exist before the allocator does (DESIGN 3.7). A single
+# non-zero field in any node body's ZERO silently moves 400+ KiB into .data and
+# into the image, so check rather than trust.
+DATA_BYTES=$(llvm-size --format=sysv "$KERNEL" | awk '$1 == ".data" { print $2 }')
+BSS_BYTES=$(llvm-size --format=sysv "$KERNEL" | awk '$1 == ".bss" { print $2 }')
+if [ "${DATA_BYTES:-0}" -gt 65536 ]; then
+    echo "error: .data is ${DATA_BYTES} bytes; something that should be zero is not." >&2
+    echo "       the graph arenas belong in .bss (currently ${BSS_BYTES} bytes)." >&2
+    exit 1
+fi
+echo "sections: .data ${DATA_BYTES} B, .bss ${BSS_BYTES} B"
+
 ISO_ROOT=build/iso_root
 rm -rf "$ISO_ROOT" && mkdir -p "$ISO_ROOT/boot/limine" "$ISO_ROOT/EFI/BOOT"
 cp "$KERNEL" "$ISO_ROOT/boot/bramble"

@@ -9,10 +9,14 @@
 #![feature(abi_x86_interrupt)]
 
 mod cpu;
+mod dump;
 mod fb;
 mod font;
+mod frames;
 mod print;
 mod serial;
+mod state;
+mod sync;
 
 use limine::request::{
     ExecutableCmdlineRequest, FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest,
@@ -197,8 +201,55 @@ extern "C" fn kmain() -> ! {
         unsafe { core::arch::asm!("ud2") };
     }
 
+    // ---- phase 2: physical memory, then the graph itself ----
+
+    let hhdm = HHDM.get_response().expect("bootloader gave no hhdm").offset();
+    let memmap = MEMORY_MAP.get_response().expect("bootloader gave no memory map");
+    let modules: &[&limine::file::File] =
+        MODULES.get_response().map(|m| m.modules()).unwrap_or(&[]);
+
+    // SAFETY: the offset and the map come from the bootloader that loaded us.
+    let allocator = unsafe { frames::FrameAllocator::new(memmap.entries(), hhdm) };
+    let bitmap = allocator.bitmap_region();
     println!();
-    cprintln!(fb::ACCENT, "phase 0 complete. halting.");
+    println!(
+        "frames: {} total, {} free, bitmap at {:#014x} ({} pages)",
+        allocator.total_frames(),
+        allocator.free_frames(),
+        bitmap.phys,
+        bitmap.pages
+    );
+    *state::FRAMES.lock() = Some(allocator);
+
+    // Prove the allocator works before anything depends on it.
+    {
+        let mut fa = state::FRAMES.lock();
+        let fa = fa.as_mut().expect("allocator");
+        let before = fa.free_frames();
+        let a = fa.alloc().expect("one frame");
+        let b = fa.alloc_contiguous(4).expect("four contiguous frames");
+        assert_eq!(fa.free_frames(), before - 5);
+        fa.free_contiguous(a, 1);
+        fa.free_contiguous(b, 4);
+        assert_eq!(fa.free_frames(), before, "frame allocator leaked");
+        println!(
+            "frames: alloc/free round trip clean ({} used, {} free)",
+            fa.used_frames(),
+            fa.free_frames()
+        );
+    }
+
+    state::populate(memmap.entries(), modules, bitmap, 0x3F8).expect("boot graph");
+    println!("graph: boot nodes created");
+    state::refresh_frame_counts();
+    state::assert_consistent("boot");
+    println!("graph: checker clean");
+    println!();
+
+    dump::dump_graph();
+
+    println!();
+    cprintln!(fb::ACCENT, "phase 2 complete. halting.");
     halt_forever();
 }
 
@@ -207,5 +258,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     cprintln!(fb::ALERT, "");
     cprintln!(fb::ALERT, "*** kernel panic ***");
     println!("{}", info);
+    dump::dump_graph_best_effort();
     halt_forever();
 }

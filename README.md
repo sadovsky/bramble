@@ -5,7 +5,7 @@ written in `no_std` Rust, whose kernel keeps all of its state in a single
 typed directed graph: processes, memory, devices, capabilities, and wait
 queues are nodes and edges, not separate tables.
 
-There is no code yet. Start with the design:
+Start with the design:
 
 - [`docs/DESIGN.md`](docs/DESIGN.md): the graph representation, the node and
   edge type system, the fast-path analysis and its compromises, what the
@@ -13,3 +13,24 @@ There is no code yet. Start with the design:
 - [`docs/PLAN.md`](docs/PLAN.md): nine implementation phases from
   "boots to a framebuffer" to the v1 goal, each with a visible milestone and
   a stated risk, ordered so the riskiest assumptions are tested first.
+
+## State of the build
+
+| Phase | Milestone | Status |
+|---|---|---|
+| 0 | Boots to a framebuffer under Limine and OVMF | done |
+| 1 | The graph crate, host-tested and benchmarked | done |
+| 2 | Frame allocator and the boot graph, inspectable | done |
+| 3 | Address spaces and the page-table invariant | next |
+| 4-8 | Threads, userspace, IPC, lifecycle, v1 | planned |
+
+```
+cargo ktest             # graph crate tests, on the host
+./scripts/build-iso.sh  # build the kernel and a UEFI ISO
+./scripts/smoke.sh      # boot headless; writes serial.log, screen.png, graph.png
+./scripts/check.sh      # everything that must pass before a commit
+```
+
+Requires QEMU, OVMF, xorriso, and Graphviz. The Rust toolchain is pinned in
+`rust-toolchain.toml`; the kernel needs nightly for `abi_x86_interrupt`, while
+`bramble-graph` itself builds on stable.
