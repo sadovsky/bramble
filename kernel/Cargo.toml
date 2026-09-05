@@ -1,0 +1,15 @@
+[package]
+name = "bramble-kernel"
+description = "The Bramble kernel: all state in one typed graph."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+limine = "0.5"
+x86_64 = "0.15"
+spin = { version = "0.9", default-features = false, features = ["spin_mutex", "once"] }
+
+[[bin]]
+name = "bramble"
+path = "src/main.rs"

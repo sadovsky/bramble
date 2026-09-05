@@ -273,6 +273,33 @@ Not part of v1. Listed so the v1 design does not paint itself out of them.
 
 Recorded as phases land, so the go/no-go gates have real numbers attached.
 
+### Phase 0: boots to a framebuffer — **done**
+
+Boots under OVMF in QEMU via Limine 9.x, UEFI only. Serial on COM1 at 115200,
+a scrolling framebuffer console with an 8x16 font baked from DejaVu Sans Mono
+by `tools/genfont.py`, and GDT, TSS and IDT with handlers for the faults a
+young kernel actually hits.
+
+All three legs of the milestone are demonstrated by `scripts/smoke.sh`, which
+boots headless, captures the serial log, takes a framebuffer screenshot over
+QMP, and fails the build if the expected line never appears:
+
+- the wordmark and console text render (`build/screen.png`);
+- the Limine memory map reaches the serial log (31 entries, 462 MiB usable);
+- `scripts/smoke.sh --cmdline faulttest` executes `ud2` and gets a register
+  dump from the `#UD` handler rather than a triple fault.
+
+Two notes for later phases. There is **no KVM** in the development container,
+so everything runs under TCG and the phase 4 and 6 timing gates have to be read
+as ratios against an in-kernel control, never as absolute cycle counts
+(DESIGN Q8). And the `limine` crate tracks protocol revision 9, so the
+bootloader binaries must come from the `v9.x-binary` branch; booting 8.x
+silently drops the renamed requests rather than failing loudly, which cost an
+hour of confusion over an empty kernel command line.
+
+**Risk retired:** toolchain and boot plumbing. The kernel needs nightly only
+for `abi_x86_interrupt`; `bramble-graph` still builds on stable.
+
 ### Phase 1: the graph crate, on the host — **done**
 
 `cargo test -p bramble-graph` runs 24 tests including two randomised property

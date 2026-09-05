@@ -1,0 +1,6 @@
+# The kernel needs the unstable `abi_x86_interrupt` feature for its exception
+# handlers. `bramble-graph` itself builds on stable and is kept that way.
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "llvm-tools", "clippy", "rustfmt"]
+targets = ["x86_64-unknown-none"]
