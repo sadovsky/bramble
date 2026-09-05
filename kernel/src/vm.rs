@@ -13,6 +13,7 @@
 use bramble_graph::body::*;
 use bramble_graph::edge::{EdgeAttr, MapsAttr, Prot};
 use bramble_graph::graph::{Graph, GraphError, Ref};
+
 use bramble_graph::id::{EdgeId, EdgeKind, NodeId, NodeKind};
 
 use crate::paging::{self, MapError, PAGE_SIZE};
@@ -45,6 +46,42 @@ pub fn create_space(owner: Ref<Root>) -> Result<Ref<AddressSpace>, VmError> {
         Err(e) => {
             // SAFETY: nothing is running on a space we just created.
             unsafe { paging::free_user_tables(pml4, fa) };
+            Err(VmError::Graph(e))
+        }
+    }
+}
+
+/// The same, owned by a process, so the space dies with it.
+pub fn create_space_for(owner: Ref<Process>) -> Result<Ref<AddressSpace>, VmError> {
+    let mut g = GRAPH.lock();
+    let mut fa = FRAMES.lock();
+    let fa = fa.as_mut().ok_or(VmError::NoAllocator)?;
+    let pml4 = paging::new_address_space(fa).ok_or(VmError::Paging(MapError::OutOfFrames))?;
+    match g.create_under_process(owner, AddressSpace { pml4_phys: pml4, ..AddressSpace::ZERO }) {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            // SAFETY: nothing is running on a space we just created.
+            unsafe { paging::free_user_tables(pml4, fa) };
+            Err(VmError::Graph(e))
+        }
+    }
+}
+
+/// Allocate frames described by a node owned by a process.
+pub fn alloc_object_for(owner: Ref<Process>, pages: u32) -> Result<Ref<MemoryObject>, VmError> {
+    let mut g = GRAPH.lock();
+    let mut fa = FRAMES.lock();
+    let fa = fa.as_mut().ok_or(VmError::NoAllocator)?;
+    let phys = fa
+        .alloc_contiguous(pages as usize)
+        .ok_or(VmError::Paging(MapError::OutOfFrames))?;
+    match g.create_under_process(
+        owner,
+        MemoryObject { phys_base: phys, pages, flags: MemFlags::NONE, ..MemoryObject::ZERO },
+    ) {
+        Ok(m) => Ok(m),
+        Err(e) => {
+            fa.free_contiguous(phys, pages as usize);
             Err(VmError::Graph(e))
         }
     }
@@ -165,7 +202,7 @@ pub fn check_page_tables(g: &Graph) -> Result<(), I5> {
         let pml4 = body.pml4_phys;
 
         // Direction one: every edge is backed by the entries it claims.
-        for eid in g.walk_out(node, EdgeKind::Maps) {
+        for eid in g.out_edges(node, EdgeKind::Maps) {
             let edge = g.edge(eid).expect("live edge");
             let attr = MapsAttr::decode(edge.data);
             let obj: Ref<MemoryObject> = g.typed(edge.dst).expect("memory object");
@@ -222,7 +259,7 @@ pub fn check_page_tables(g: &Graph) -> Result<(), I5> {
 
 /// Is this hardware mapping accounted for by some `Maps` edge on this space?
 fn covered(g: &Graph, space: NodeId, vaddr: u64, phys: u64) -> bool {
-    for eid in g.walk_out(space, EdgeKind::Maps) {
+    for eid in g.out_edges(space, EdgeKind::Maps) {
         let edge = match g.edge(eid) {
             Some(e) => e,
             None => continue,

@@ -18,6 +18,11 @@ fi
 cargo build -p bramble-kernel "${CARGO_FLAGS[@]}"
 KERNEL="target/x86_64-unknown-none/$PROFILE/bramble"
 
+# User programs are always built optimised: they are test subjects, not the
+# thing under test, and a debug build of one is several megabytes of ELF.
+PROFILE=release ./user/build.sh >/dev/null
+USER_DIR="user/target/x86_64-unknown-none/release"
+
 # The whole graph is meant to live in .bss: Graph::EMPTY is all zeroes, which
 # is what lets it exist before the allocator does (DESIGN 3.7). A single
 # non-zero field in any node body's ZERO silently moves 400+ KiB into .data and
@@ -35,6 +40,9 @@ ISO_ROOT=build/iso_root
 rm -rf "$ISO_ROOT" && mkdir -p "$ISO_ROOT/boot/limine" "$ISO_ROOT/EFI/BOOT"
 cp "$KERNEL" "$ISO_ROOT/boot/bramble"
 cp limine.conf "$ISO_ROOT/boot/limine/"
+for program in hello faulter; do
+    cp "$USER_DIR/$program" "$ISO_ROOT/boot/$program"
+done
 cp "$LIMINE_DIR/limine-uefi-cd.bin" "$ISO_ROOT/boot/limine/"
 cp "$LIMINE_DIR/BOOTX64.EFI" "$ISO_ROOT/EFI/BOOT/"
 

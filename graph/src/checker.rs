@@ -313,7 +313,7 @@ impl Checker {
                 }
             }
             // And the converse: no orphan capability edges.
-            for eid in g.walk_out(node, EdgeKind::Holds) {
+            for eid in g.out_edges(node, EdgeKind::Holds) {
                 let e = g.edge(eid).expect("live");
                 let slot = HoldsAttr::decode(e.data).slot as usize;
                 if slot == 0 || slot >= HANDLE_SLOTS || body.handles[slot] != eid.idx() {
@@ -376,7 +376,7 @@ impl Checker {
                     let cached = g.body(s).expect("body").mapping_count;
                     let mut count = 0u32;
                     let mut ids = [EdgeId::NULL; MAX_WALK];
-                    for (n, e) in g.walk_out(node, EdgeKind::Maps).into_iter().enumerate() {
+                    for (n, e) in g.out_edges(node, EdgeKind::Maps).enumerate() {
                         if n < MAX_WALK {
                             ids[n] = e;
                             count += 1;

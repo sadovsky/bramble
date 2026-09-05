@@ -612,7 +612,7 @@ impl Graph {
     ) -> Result<EdgeId> {
         self.precheck_link(s.id, EdgeKind::Maps, m.id)?;
         // Invariant I7: ranges within one address space must not overlap.
-        for e in self.walk_out(s.id, EdgeKind::Maps) {
+        for e in self.out_edges(s.id, EdgeKind::Maps) {
             if let Some(edge) = self.edge(e) {
                 if MapsAttr::decode(edge.data).overlaps(&attr) {
                     return Err(GraphError::RangeOverlap);
@@ -642,7 +642,7 @@ impl Graph {
     /// The one name query the kernel offers (DESIGN appendix A).
     pub fn lookup_name(&self, name: &str) -> Option<NodeId> {
         let root = self.root()?;
-        for eid in self.walk_out(root.id, EdgeKind::Named) {
+        for eid in self.out_edges(root.id, EdgeKind::Named) {
             let e = self.edge(eid)?;
             if NamedAttr::decode(e.data).matches(name) {
                 return Some(e.dst);
@@ -878,7 +878,7 @@ impl Graph {
     /// The first thread waiting on an object in the given role, or none.
     /// This is IPC rendezvous: the head of one list.
     pub fn first_waiter(&self, on: NodeId, role: WaitRole) -> Option<Ref<Thread>> {
-        for eid in self.walk_in(on, EdgeKind::Waiting) {
+        for eid in self.in_edges(on, EdgeKind::Waiting) {
             let e = self.edge(eid)?;
             if WaitingAttr::decode(e.data).role as u8 == role as u8 {
                 return Some(Ref::from_raw(e.src));

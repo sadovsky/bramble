@@ -174,3 +174,24 @@ impl fmt::Write for Console {
 }
 
 pub static CONSOLE: Mutex<Console> = Mutex::new(Console::new());
+
+/// Break the console lock so a crash can be reported. See `serial::force_unlock`.
+///
+/// # Safety
+/// Only from a path that is not going to return.
+pub unsafe fn force_unlock() {
+    unsafe { CONSOLE.force_unlock() };
+}
+
+/// Echo raw bytes to the framebuffer console, if there is one.
+pub fn write_bytes(bytes: &[u8]) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut c = CONSOLE.lock();
+        if !c.is_attached() {
+            return;
+        }
+        for &b in bytes {
+            c.write_byte(b);
+        }
+    });
+}

@@ -10,15 +10,20 @@
 
 mod cpu;
 mod dump;
+mod elf;
 mod fb;
 mod font;
 mod frames;
+mod inspect;
 mod paging;
+mod percpu;
 mod print;
+mod proc;
 mod reaper;
 mod sched;
 mod selftest;
 mod serial;
+mod syscall;
 mod state;
 mod sync;
 mod time;
@@ -152,7 +157,9 @@ extern "C" fn kmain() -> ! {
     println!();
 
     cpu::init();
-    println!("cpu:  gdt, tss and idt loaded");
+    percpu::init();
+    syscall::init();
+    println!("cpu:  gdt, tss, idt, per-cpu base and syscall entry ready");
 
     if let Some(hhdm) = HHDM.get_response() {
         println!("hhdm: physical memory mapped at {:#018x}", hhdm.offset());
@@ -268,13 +275,24 @@ extern "C" fn kmain() -> ! {
     println!();
     dump::dump_graph();
 
+    // ---- phase 5: userspace ----
     println!();
-    cprintln!(fb::ACCENT, "phase 4 complete. halting.");
+    selftest::userspace(modules);
+    println!();
+    dump::dump_graph();
+
+    println!();
+    cprintln!(fb::ACCENT, "phase 5 complete. halting.");
     halt_forever();
 }
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    // SAFETY: this path never returns.
+    unsafe {
+        serial::force_unlock();
+        fb::force_unlock();
+    }
     cprintln!(fb::ALERT, "");
     cprintln!(fb::ALERT, "*** kernel panic ***");
     println!("{}", info);

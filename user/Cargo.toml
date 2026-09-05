@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "bramble-user"
+description = "Bramble's userspace runtime and its first programs."
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bramble-abi = { path = "../abi" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+debug = true

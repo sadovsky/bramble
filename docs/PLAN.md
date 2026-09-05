@@ -504,3 +504,73 @@ past one core, so this becomes LAPIC work when SMP arrives (phase 9 item 4).
 before userspace. It was worth finding out here that the honest answer is "the
 graph costs several times more for the decision and it does not matter", rather
 than in phase 8.
+
+### Phase 5: userspace — **done**
+
+Ring 3, `syscall`/`sysret`, an ELF64 loader, processes with handle tables, and
+six system calls: `exit`, `yield`, `write`, `lookup`, `inspect`, `rights`. Two
+user programs ship as boot modules, built from `user/`, a separate workspace
+with its own linker script.
+
+The milestone runs at every boot and fails the build if any leg misbehaves:
+
+- `hello` prints through a capability carrying `Write`;
+- the *same device* through a second capability without that right is refused
+  with `E_PERM`, and an ungranted slot returns `E_BADHANDLE` — not "denied",
+  but "there is nothing there to deny";
+- a pointer into the kernel's half is refused with `E_FAULT`, checked against
+  the caller's own `Maps` edges rather than a copy of them;
+- `lookup("console")` mints a fresh capability, requiring a root capability
+  carrying `Lookup`;
+- `inspect` copies the entire kernel state into the program's buffer, which it
+  decodes and counts by kind with no kernel help;
+- `hello` exits cleanly and every frame comes back;
+- `faulter` writes through a null pointer, is destroyed mid-instruction, and
+  every frame comes back with all invariants still holding.
+
+Measured: 117413 free frames before, 117413 after two processes lived and died.
+
+**Six real bugs, all worth recording.**
+
+1. **The boot context lost its own stack pointer.** Phase 4's teardown deleted
+   the boot `Thread` node, so phase 5's first context switch had nothing to
+   switch *back* to and discarded the outgoing stack pointer. Phase 5 re-adopts
+   a boot thread.
+2. **The system-call stub did not preserve caller-saved registers.** `dispatch`
+   is an ordinary C function and treats `rdi`, `rsi`, `rdx`, `r8`-`r10` as
+   scratch, but the caller's compiler assumes they survive. A program's own
+   `write` destroyed the `self` pointer it was about to use. The ABI now says
+   only `rcx` and `r11` are clobbered, and the stub honours it.
+3. **A kernel stack overflow that failed silently.** `walk_out` returns a 2 KiB
+   array *by value*, and the `lookup` path used three of them. Kernel stacks
+   live in the direct map, so there is no guard page: the overflow walked into
+   neighbouring physical memory and the machine simply stopped. Read-only walks
+   now use the borrowing iterator, stacks are 8 pages, and every kernel stack
+   carries a canary that the consistency pass checks.
+4. **The kernel ran on an address space it had destroyed.** Killing a process
+   switched to a kernel thread, which has no address space of its own, and
+   `cr3` was left pointing at the dead process's tables. The reaper freed those
+   frames, the allocator handed one straight back as the next process's page
+   table root, and zeroing it wiped the live mappings. A thread with no address
+   space of its own now runs in the kernel's.
+5. **`swapgs` cannot be paired with Rust's `x86-interrupt` handlers.** Every
+   entry from ring 3 must swap and every exit must undo it, but an
+   `x86-interrupt` function generates its own prologue and cannot swap first, so
+   a timer arriving during user code left the two bases crossed. v1 drops `gs`
+   entirely and reads two absolute addresses instead. **Debt:** SMP needs a
+   per-cpu block, which means hand-written interrupt stubs that swap
+   conditionally on the saved code segment.
+6. **A fault while holding the serial lock deadlocked the fault handler.** The
+   crash paths now break the console locks first, the way Linux's
+   `bust_spinlocks` does. Three of the bugs above presented as "the machine
+   stops with no output"; this is why.
+
+Also fixed: boot-module `MemoryObject`s recorded the bootloader's *virtual*
+address as their physical base, and the ELF loader now lays images out per page
+with the protections of every segment touching a page unioned, because lld
+synthesises `.got` after any linker script has had its say and no script can
+stop two segments sharing a page.
+
+**Risk retired:** the ABI plumbing the plan expected to be the phase most
+likely to eat a weekend on one bug. It ate several, and every one of them was
+in the conventional machinery rather than in anything to do with the graph.

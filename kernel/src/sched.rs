@@ -60,6 +60,46 @@ unsafe extern "C" fn switch_stack(save_rsp: *mut u64, new_rsp: u64) {
     );
 }
 
+/// Mark the bottom of a kernel stack so an overflow can be detected.
+///
+/// # Safety
+/// `stack_top` must be the top of `KSTACK_PAGES` frames of writable memory.
+pub unsafe fn plant_canary(stack_top: u64) {
+    let bottom = stack_top - KSTACK_PAGES as u64 * 4096;
+    unsafe { (bottom as *mut u64).write(STACK_CANARY) };
+}
+
+/// Has any live thread's kernel stack been written past its bottom?
+///
+/// Kernel stacks live in the direct map, so there is no guard page to fault on;
+/// without this an overflow silently corrupts unrelated physical memory. Four
+/// pages was too few for the system-call path and the failure looked like a
+/// hang with no output at all.
+pub fn check_stack_canaries(g: &bramble_graph::graph::Graph) -> Result<(), NodeId> {
+    for id in g.live_nodes() {
+        if id.kind() != Some(bramble_graph::id::NodeKind::Thread) {
+            continue;
+        }
+        let t: Ref<Thread> = match g.typed(id) {
+            Some(t) => t,
+            None => continue,
+        };
+        let top = match g.body(t) {
+            Some(b) => b.kstack_top,
+            None => continue,
+        };
+        if top == 0 {
+            continue; // the boot context's stack is the bootloader's
+        }
+        let bottom = top - KSTACK_PAGES as u64 * 4096;
+        // SAFETY: reading one word of a stack this kernel allocated.
+        if unsafe { (bottom as *const u64).read() } != STACK_CANARY {
+            return Err(id);
+        }
+    }
+    Ok(())
+}
+
 /// Lay out a stack so that switching to it enters `entry` with interrupts on.
 ///
 /// # Safety
@@ -86,6 +126,10 @@ pub unsafe fn init_stack(stack_top: u64, entry: extern "C" fn() -> !) -> u64 {
 struct Decision {
     save_slot: *mut u64,
     new_rsp: u64,
+    /// Page-table root of the incoming thread, or zero for a kernel thread.
+    cr3: u64,
+    /// Kernel stack for entries from ring 3, or zero.
+    kstack_top: u64,
     switching: bool,
 }
 
@@ -144,17 +188,79 @@ pub fn schedule() {
         };
 
         let _ = g.make_running(cpu, next);
-        let new_rsp = match g.body(next) {
-            Some(b) => b.saved_rsp,
+        let (new_rsp, cr3, kstack_top) = match g.body(next) {
+            Some(b) => (b.saved_rsp, b.cr3, b.kstack_top),
             None => return,
         };
-        Decision { save_slot, new_rsp, switching: true }
+        Decision { save_slot, new_rsp, cr3, kstack_top, switching: true }
     };
 
-    if decision.switching {
-        // SAFETY: interrupts are off and this is the only core, so the arena
-        // cannot move; both stack pointers were prepared by this module.
-        unsafe { switch_stack(decision.save_slot, decision.new_rsp) };
+    if !decision.switching {
+        return;
+    }
+
+    // A thread that can reach ring 3 needs its own address space installed and
+    // its kernel stack recorded, before it runs. Getting the second wrong means
+    // an interrupt from user mode lands on someone else's stack.
+    //
+    // A thread with no address space of its own runs in the kernel's, and that
+    // is not a detail. Leaving the previous process's tables loaded means the
+    // kernel keeps running on an address space it is about to destroy: the
+    // reaper frees those page-table frames, the allocator hands one straight
+    // back for the next process's root, and zeroing it wipes the mappings out
+    // from under the code doing the zeroing. The machine stops with no output.
+    let target_cr3 = if decision.cr3 != 0 { decision.cr3 } else { paging::kernel_pml4() };
+    if target_cr3 != 0 && target_cr3 != paging::active_pml4() {
+        // SAFETY: the value came from an AddressSpace node this kernel built,
+        // and every such space shares the kernel's higher half.
+        unsafe { paging::load_pml4(target_cr3) };
+    }
+    if decision.kstack_top != 0 {
+        crate::cpu::set_kernel_stack(decision.kstack_top);
+    }
+
+    // SAFETY: interrupts are off and this is the only core, so the arena
+    // cannot move; both stack pointers were prepared by this module.
+    unsafe { switch_stack(decision.save_slot, decision.new_rsp) };
+}
+
+/// End the calling process: it and everything it owns become unreachable, and
+/// the cpu moves on. The reaper returns the storage later, from another thread,
+/// which is why it is safe to do this while standing on a stack the process
+/// owns.
+pub fn exit_current_process(code: i32) -> ! {
+    x86_64::instructions::interrupts::disable();
+    {
+        let mut g = GRAPH.lock();
+        let me = current_locked(&g);
+        let owner = g
+            .typed::<Thread>(me)
+            .and_then(|t| g.body(t))
+            .map(|b| b.owner_proc)
+            .unwrap_or(NodeId::NULL);
+        if let Some(p) = g.typed::<bramble_graph::body::Process>(owner) {
+            if let Some(b) = g.body_mut(p) {
+                b.exit_code = code;
+            }
+            let _ = g.begin_delete(owner);
+        }
+        let _ = g.begin_delete(me);
+        if let Some(cpu) = g.typed::<Cpu>(BOOT.lock().cpu0) {
+            if let Some(b) = g.body_mut(cpu) {
+                b.current = NodeId::NULL;
+            }
+        }
+    }
+    schedule();
+    unreachable!("an exited process was scheduled again");
+}
+
+/// The running thread, read from a graph the caller already has locked.
+/// The spin lock is not reentrant, so calling `current()` under it would hang.
+pub fn current_locked(g: &bramble_graph::graph::Graph) -> NodeId {
+    match g.typed::<Cpu>(BOOT.lock().cpu0) {
+        Some(cpu) => g.body(cpu).map(|b| b.current).unwrap_or(NodeId::NULL),
+        None => NodeId::NULL,
     }
 }
 
@@ -207,7 +313,16 @@ use crate::paging;
 use crate::vm;
 
 /// Kernel stack size per thread, in frames.
-pub const KSTACK_PAGES: u32 = 4;
+///
+/// Four pages was not enough and failed silently. Kernel stacks sit inside the
+/// direct map, so there is no unmapped guard page below them: an overflow walks
+/// into whatever physical memory happens to be next and corrupts it. The
+/// canary below turns that into a diagnosis instead of a mystery.
+pub const KSTACK_PAGES: u32 = 8;
+
+/// Written at the lowest word of every kernel stack and checked by the graph
+/// consistency pass.
+pub const STACK_CANARY: u64 = 0x00B2_AB1E_57AC_C0DE;
 
 /// Create a kernel thread with its own stack and queue it to run.
 ///
@@ -227,6 +342,8 @@ pub fn spawn_kernel_thread(
     let stack_top = paging::hhdm() + phys + (KSTACK_PAGES as u64) * 4096;
     // SAFETY: freshly allocated frames, direct-mapped, used by nothing else.
     let saved_rsp = unsafe { init_stack(stack_top, entry) };
+    // SAFETY: as above; the lowest word of a stack nothing has used yet.
+    unsafe { plant_canary(stack_top) };
 
     let mut g = GRAPH.lock();
     let t = g.create_under_root(
@@ -243,6 +360,49 @@ pub fn spawn_kernel_thread(
     let cpu: Ref<Cpu> = g.typed(BOOT.lock().cpu0).ok_or(vm::VmError::StaleSpace)?;
     g.make_ready(cpu, t)?;
     Ok(t)
+}
+
+/// The first instruction a user thread's kernel stack returns into.
+///
+/// Everything up to here is ordinary kernel scheduling; this is the doorway.
+/// The address space and the kernel stack were installed by `schedule` on the
+/// way in, so all that is left is to hand the CPU a ring 3 frame and let it go.
+pub extern "C" fn enter_user() -> ! {
+    // `iretq` restores the user's flags with interrupts on. Until then they
+    // stay off, so nothing can arrive while the ring 3 frame is half built.
+    x86_64::instructions::interrupts::disable();
+
+    let (entry, user_rsp) = {
+        let g = GRAPH.lock();
+        let t: Ref<Thread> = match g.typed(current_locked(&g)) {
+            Some(t) => t,
+            None => panic!("enter_user with no current thread"),
+        };
+        let b = g.body(t).expect("thread body");
+        (b.user_entry, b.msg.words[0])
+    };
+    let sel = crate::cpu::selectors();
+    // Requested privilege level 3 in both selectors: this is the transition.
+    let cs = (sel.user_code.0 | 3) as u64;
+    let ss = (sel.user_data.0 | 3) as u64;
+
+    // SAFETY: the frame describes a valid ring 3 context in the address space
+    // already installed for this thread, and interrupts are off across swapgs.
+    unsafe {
+        core::arch::asm!(
+            "push {ss}",
+            "push {rsp}",
+            "push 0x202",
+            "push {cs}",
+            "push {rip}",
+            "iretq",
+            ss = in(reg) ss,
+            rsp = in(reg) user_rsp,
+            cs = in(reg) cs,
+            rip = in(reg) entry,
+            options(noreturn),
+        )
+    }
 }
 
 /// Give the boot path a `Thread` node, so that the thing currently running is

@@ -17,31 +17,53 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 const STACK_PAGES: usize = 5; // 20 KiB
 static mut DF_STACK: [u8; STACK_PAGES * 4096] = [0; STACK_PAGES * 4096];
 
-struct Selectors {
-    kernel_code: SegmentSelector,
-    kernel_data: SegmentSelector,
-    #[allow(dead_code)]
-    user_code: SegmentSelector,
-    #[allow(dead_code)]
-    user_data: SegmentSelector,
-    tss: SegmentSelector,
+pub struct Selectors {
+    pub kernel_code: SegmentSelector,
+    pub kernel_data: SegmentSelector,
+    pub user_code: SegmentSelector,
+    pub user_data: SegmentSelector,
+    pub tss: SegmentSelector,
 }
 
-static TSS: Once<TaskStateSegment> = Once::new();
+/// The task state segment is mutable after boot: `rsp0` is the stack the CPU
+/// switches to when an interrupt arrives while ring 3 is running, so it has to
+/// track whichever thread is current.
+static mut TSS: TaskStateSegment = TaskStateSegment::new();
 static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 
+/// Point the CPU at the kernel stack to use for the next entry from ring 3.
+///
+/// # Safety-relevant invariant
+/// Must be called on every switch to a thread that can reach user mode, before
+/// that thread runs. Getting it wrong means an interrupt lands on the previous
+/// thread's stack, which is silent corruption.
+pub fn set_kernel_stack(top: u64) {
+    // SAFETY: single core, and callers hold interrupts off. The reference does
+    // not escape.
+    unsafe {
+        (&raw mut TSS).as_mut().expect("tss static").privilege_stack_table[0] =
+            VirtAddr::new(top);
+    }
+    crate::percpu::set_kernel_rsp(top);
+}
+
+pub fn selectors() -> &'static Selectors {
+    &GDT.get().expect("gdt is initialised").1
+}
+
 pub fn init() {
-    let tss = TSS.call_once(|| {
-        let mut tss = TaskStateSegment::new();
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-            // SAFETY: a private static used only as a stack; taking its address
-            // is the only way to hand the CPU a stack pointer.
+    // SAFETY: single core, called once before anything else can touch it.
+    let tss: &'static TaskStateSegment = unsafe {
+        (&raw mut TSS).as_mut().expect("tss static").interrupt_stack_table
+            [DOUBLE_FAULT_IST_INDEX as usize] = {
+            // A private static used only as a stack; taking its address is the
+            // only way to hand the CPU a stack pointer.
             let start = VirtAddr::from_ptr(&raw const DF_STACK);
             start + (STACK_PAGES * 4096) as u64
         };
-        tss
-    });
+        (&raw const TSS).as_ref().expect("tss static")
+    };
 
     let (gdt, sel) = GDT.call_once(|| {
         let mut gdt = GlobalDescriptorTable::new();
@@ -95,6 +117,12 @@ pub fn init_interrupt_controller() {
 }
 
 fn dump(name: &str, frame: &InterruptStackFrame, code: Option<u64>) {
+    // SAFETY: every caller halts or kills a process afterwards. Without this a
+    // fault taken while printing deadlocks silently.
+    unsafe {
+        crate::serial::force_unlock();
+        crate::fb::force_unlock();
+    }
     crate::cprintln!(crate::fb::ALERT, "");
     crate::cprintln!(crate::fb::ALERT, "*** exception: {} ***", name);
     if let Some(c) = code {
@@ -134,7 +162,29 @@ extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
     // Breakpoints are recoverable: this is the one handler that returns.
 }
 
+/// A page fault from ring 3 is the process's problem, not the kernel's.
+///
+/// Destroying it is one `begin_delete`: the address space, its page tables, its
+/// memory and its threads are all owned by the process, so detaching one edge
+/// makes the lot unreachable and the reaper returns it later. There is no
+/// cleanup path to write, and that is the ownership tree earning its keep.
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
+    let from_user = code.contains(PageFaultErrorCode::USER_MODE);
+    if from_user {
+        // SAFETY: the faulting process is about to be destroyed.
+        unsafe {
+            crate::serial::force_unlock();
+            crate::fb::force_unlock();
+        }
+        crate::cprintln!(crate::fb::ALERT, "");
+        crate::cprintln!(
+            crate::fb::ALERT,
+            "*** killing a process: page fault at {:#x} from ring 3 ***",
+            x86_64::registers::control::Cr2::read_raw()
+        );
+        crate::println!("  rip {:#018x}  cause {:?}", frame.instruction_pointer.as_u64(), code);
+        crate::sched::exit_current_process(-11);
+    }
     dump("page fault", &frame, Some(code.bits()));
     crate::println!("  cause: {:?}", code);
     crate::halt_forever();

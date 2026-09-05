@@ -78,6 +78,38 @@ impl fmt::Write for SerialPort {
 
 pub static SERIAL: Mutex<SerialPort> = Mutex::new(SerialPort::new(COM1));
 
+/// Break the serial lock so a crash can be reported.
+///
+/// A fault taken while this lock is held would otherwise deadlock the fault
+/// handler against the code it is reporting on, and the machine stops with no
+/// output at all: the single most misleading failure a kernel can produce.
+/// Linux calls the same trick `bust_spinlocks`.
+///
+/// # Safety
+/// Only from a path that is not going to return, and after which no other
+/// thread will run.
+pub unsafe fn force_unlock() {
+    unsafe { SERIAL.force_unlock() };
+}
+
 pub fn init() {
     SERIAL.lock().init();
+}
+
+/// Write raw bytes to a serial device named by its port base. Used by the
+/// `write` system call, where the port came out of a `Device` node the caller
+/// holds a capability to.
+pub fn write_bytes(io_base: u16, bytes: &[u8]) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut port = SERIAL.lock();
+        if port.base != io_base {
+            return;
+        }
+        for &b in bytes {
+            if b == b'\n' {
+                port.write_byte(b'\r');
+            }
+            port.write_byte(b);
+        }
+    });
 }

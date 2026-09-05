@@ -29,6 +29,8 @@ static CHECKER: IrqLock<Checker> = IrqLock::new(Checker::new());
 pub enum Inconsistency {
     Graph(bramble_graph::checker::Violation),
     PageTables(crate::vm::I5),
+    /// A thread wrote past the bottom of its kernel stack.
+    StackOverflow(NodeId),
 }
 
 /// Run every invariant check against the live graph, under one lock hold.
@@ -40,6 +42,7 @@ pub fn check_now() -> Result<(), Inconsistency> {
     let mut c = CHECKER.lock();
     c.check(&g).map_err(Inconsistency::Graph)?;
     crate::vm::check_page_tables(&g).map_err(Inconsistency::PageTables)?;
+    crate::sched::check_stack_canaries(&g).map_err(Inconsistency::StackOverflow)?;
     Ok(())
 }
 
@@ -160,10 +163,13 @@ pub fn populate(
     g.link_named(root, bm, "frame-bitmap")?;
 
     for (i, f) in modules.iter().enumerate() {
+        // Limine hands modules to us through the direct map, so the pointer is
+        // virtual. A MemoryObject records physical addresses.
+        let phys = (f.addr() as u64).saturating_sub(crate::paging::hhdm());
         let m = g.create_under_root(
             root,
             MemoryObject {
-                phys_base: f.addr() as u64,
+                phys_base: phys,
                 pages: pages_for(f.size()),
                 flags: MemFlags::PINNED,
                 ..MemoryObject::ZERO
@@ -202,6 +208,7 @@ pub fn populate(
         },
     )?;
     boot.kernel_space = kspace.id();
+    crate::paging::set_kernel_pml4(crate::paging::active_pml4());
     g.link_named(root, kspace, "kernel-space")?;
     g.link_maps(
         kspace,

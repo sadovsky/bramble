@@ -1,0 +1,6 @@
+[package]
+name = "bramble-abi"
+description = "The kernel/userspace contract: syscall numbers, error codes, rights, and the inspect record format."
+version.workspace = true
+edition.workspace = true
+license.workspace = true

@@ -15,6 +15,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "bramble-abi"
+version = "0.1.0"
+
+[[package]]
 name = "bramble-graph"
 version = "0.1.0"
 
@@ -22,6 +26,7 @@ version = "0.1.0"
 name = "bramble-kernel"
 version = "0.1.0"
 dependencies = [
+ "bramble-abi",
  "bramble-graph",
  "limine",
  "spin",

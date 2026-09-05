@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["graph", "kernel"]
+members = ["abi", "graph", "kernel"]
+exclude = ["user"]
 
 [workspace.package]
 version = "0.1.0"

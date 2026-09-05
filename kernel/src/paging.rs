@@ -30,8 +30,24 @@ const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 /// The bootloader's direct map offset. Set once at boot, read everywhere.
 static HHDM: AtomicU64 = AtomicU64::new(0);
 
+/// The kernel's own page-table root: the address space to run in when the
+/// current thread has none of its own.
+///
+/// Cached outside the graph so the context switch does not need a lookup. It is
+/// set once at boot and never changes, which is invariant I5' restated.
+static KERNEL_PML4: AtomicU64 = AtomicU64::new(0);
+
 pub fn set_hhdm(offset: u64) {
     HHDM.store(offset, Ordering::Release);
+}
+
+pub fn set_kernel_pml4(phys: u64) {
+    KERNEL_PML4.store(phys, Ordering::Release);
+}
+
+#[inline]
+pub fn kernel_pml4() -> u64 {
+    KERNEL_PML4.load(Ordering::Acquire)
 }
 
 #[inline]

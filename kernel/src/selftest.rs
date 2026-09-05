@@ -397,3 +397,120 @@ fn preemption_demo(root: Ref<bramble_graph::body::Root>) {
     );
     state::assert_consistent("after the preemption demo");
 }
+
+// ---------------------------------------------------------------- phase 5 ---
+
+use bramble_graph::body::Rights;
+use bramble_graph::id::NodeId;
+
+/// Find a boot module by the last component of its path.
+fn find_module<'a>(modules: &'a [&limine::file::File], name: &str) -> Option<&'a [u8]> {
+    for f in modules {
+        let path = f.path().to_bytes();
+        let start = path.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1);
+        if &path[start..] == name.as_bytes() {
+            // SAFETY: the bootloader mapped the module and told us its extent.
+            return Some(unsafe {
+                core::slice::from_raw_parts(f.addr() as *const u8, f.size() as usize)
+            });
+        }
+    }
+    None
+}
+
+/// Run until a node is gone from the graph, draining the reaper as we go.
+fn run_until_gone(id: NodeId, what: &str) {
+    let deadline = crate::time::ticks() + 600;
+    loop {
+        crate::sched::yield_now();
+        reaper::drain();
+        if !GRAPH.lock().is_live(id) {
+            return;
+        }
+        assert!(crate::time::ticks() < deadline, "{} never finished", what);
+    }
+}
+
+/// Phase 5: ring 3, system calls, and authority as an edge.
+pub fn userspace(modules: &[&limine::file::File]) {
+    let baseline = free_frames();
+    let (root, console, root_id) = {
+        let g = GRAPH.lock();
+        let boot = crate::state::BOOT.lock();
+        (g.root().expect("root"), boot.console, boot.root)
+    };
+
+    // The running context needs a Thread node of its own again: phase 4 tore
+    // its one down. Without it the scheduler has nothing to switch *back* to,
+    // and discards this context's stack pointer the first time it switches
+    // away, which is a very confusing way to lose a kernel.
+    let boot = crate::sched::adopt_boot_thread(root).expect("boot thread");
+    state::assert_consistent("after re-adopting the boot thread");
+
+    // The timer keeps running, so user code is genuinely preempted rather than
+    // merely cooperatively scheduled. That also exercises the task state
+    // segment: an interrupt from ring 3 has to land on this thread's kernel
+    // stack and no other.
+    x86_64::instructions::interrupts::enable();
+
+    let hello = find_module(modules, "hello").expect("the hello module is missing");
+    println!("proc: loading hello ({} KiB of ELF)", hello.len() >> 10);
+
+    // Its entire authority, in three edges. The second is deliberately the same
+    // device as the first with the write right withheld, which is the whole
+    // demonstration: the program is unchanged, only the edge differs.
+    let grants = [
+        (console, Rights::READ.union(Rights::WRITE)),
+        (console, Rights::READ),
+        (root_id, Rights::LOOKUP),
+    ];
+    let proc = crate::proc::spawn(root, hello, &grants)
+        .unwrap_or_else(|e| panic!("could not spawn hello: {}", e.describe()));
+    state::assert_consistent("after spawning hello");
+    println!("proc: hello is {:?}, running it now", proc.id());
+    println!();
+
+    run_until_gone(proc.id(), "hello");
+    println!();
+    state::assert_consistent("after hello exited");
+    let after_hello = free_frames();
+    assert_eq!(after_hello, baseline, "hello leaked frames");
+    cprintln!(fb::ACCENT, "proc: hello exited and gave back every frame it held");
+
+    // Now the same machinery, applied to a program that misbehaves.
+    let faulter = find_module(modules, "faulter").expect("the faulter module is missing");
+    println!("proc: loading faulter ({} KiB of ELF)", faulter.len() >> 10);
+    let proc = crate::proc::spawn(root, faulter, &[(console, Rights::READ.union(Rights::WRITE))])
+        .unwrap_or_else(|e| panic!("could not spawn faulter: {}", e.describe()));
+    println!("proc: faulter loaded");
+    state::assert_consistent("after spawning faulter");
+    println!();
+    println!("proc: faulter is {:?}, and is about to misbehave", proc.id());
+
+    run_until_gone(proc.id(), "faulter");
+    state::assert_consistent("after killing faulter");
+    let after_faulter = free_frames();
+    assert_eq!(after_faulter, baseline, "killing faulter leaked frames");
+
+    x86_64::instructions::interrupts::disable();
+    {
+        let mut g = GRAPH.lock();
+        g.begin_delete(boot.id()).expect("delete boot thread");
+        if let Some(cpu) = g.typed::<Cpu>(crate::state::BOOT.lock().cpu0) {
+            if let Some(b) = g.body_mut(cpu) {
+                b.current = NodeId::NULL;
+            }
+        }
+    }
+    reaper::drain();
+    state::assert_consistent("after phase 5 teardown");
+    println!();
+    cprintln!(
+        fb::ACCENT,
+        "proc: a process died mid-instruction and the graph is still consistent"
+    );
+    println!(
+        "proc: free frames {} before, {} after two processes lived and died",
+        baseline, after_faulter
+    );
+}

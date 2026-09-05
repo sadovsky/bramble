@@ -804,3 +804,241 @@ it likes. That means the CPU's privilege levels, the system call instruction, an
 the first real use of the capability system — a program that can print only
 because it holds an arrow saying it may, and that fails cleanly when the arrow is
 taken away.
+
+---
+
+## Entry 6 — Phase 5: the first code that is not trusted
+
+**Milestone: a program that can print only because it holds an edge saying it
+may, and a program that misbehaves and is destroyed without taking anything
+with it.**
+
+This is where the capability system stops being a diagram.
+
+### The concepts
+
+**Privilege rings.** The processor has four privilege levels; everyone uses two.
+**Ring 0** may do anything: change page tables, talk to hardware, halt the
+machine. **Ring 3** may not. The kernel runs in ring 0, programs in ring 3.
+This is enforced by silicon, not by good manners.
+
+**System calls.** A ring 3 program that wants something done asks the kernel.
+The `syscall` instruction jumps to a fixed address in ring 0. It is a doorway
+with exactly one entrance, and everything on the other side is the kernel's
+choice.
+
+The awkward part: on arrival, the stack pointer still points at the *user's*
+stack, which the kernel cannot trust. It has to find its own stack before doing
+anything, using only registers. Real kernels stash a per-core pointer in the
+`gs` segment base and use a special instruction, `swapgs`, to flip between the
+user's `gs` and the kernel's. More on that below, because it bit us.
+
+**ELF.** The file format executables come in. Its useful part is a list of
+**segments**: "take these bytes from the file, put them at this address, with
+these permissions". A loader maps memory and copies bytes in. That is all
+Bramble's loader does — no dynamic linking, no relocations, no interpreter.
+
+**Handles.** Userspace never sees a kernel pointer or an internal id. It gets
+small integers — **slot numbers** — that index a per-process table. Slot 1 might
+mean the console. This is `open()` returning `3` in Unix, and it is the same
+idea everywhere.
+
+### How authority is normally decided
+
+In Unix, mostly by **who you are**. Every process has a user id. When you open
+a file, the kernel compares your id against the file's permission bits. Your
+authority is *ambient*: it applies to everything you do, whether you wanted it
+to or not.
+
+That has a well-known consequence. A PDF viewer you run inherits your ability to
+read every file you own, because it is running as you. It does not need that
+authority, and cannot easily give it up. The mismatch between "what a program
+needs" and "what it is handed" is where a great deal of security goes wrong, and
+it is called the **confused deputy** problem: a program with authority is
+tricked into using it on someone else's behalf.
+
+The alternative, **capabilities**, is older than Unix and keeps losing on
+adoption rather than on merit. Authority is not a property of who you are but a
+thing you *hold*. You can only act on what you were handed. There is no ambient
+anything.
+
+### What Bramble does
+
+Authority is a `Holds` edge, and there is no other kind.
+
+When the kernel creates the `hello` process it grants exactly three
+capabilities, and that is the entire universe the program can affect:
+
+```
+Holds Process -> Device  rights=RW  slot=1     the console, writable
+Holds Process -> Device  rights=R   slot=2     the same console, not writable
+Holds Process -> Root    rights=l   slot=3     the root, lookup only
+```
+
+Slots 1 and 2 point at *the same device*. The program is identical in both
+calls. Only the edge differs:
+
+```
+[user] slot 1 (console) carries RW, slot 2 (same console) carries R, slot 3 (root) carries l
+[user] writing through the read-only capability was refused, as it should be
+```
+
+There is no user id anywhere in Bramble, and no plan to add one. The check is
+one edge lookup: find slot 1 in the handle table, follow it to the `Holds` edge,
+test the rights bits, follow it to the object. Three dependent loads.
+
+Then the part that is not merely "denied":
+
+```
+[user] an ungranted slot names nothing, so there is nothing to refuse
+```
+
+Writing through slot 200 does not return "permission denied". It returns "bad
+handle", because there is *no object on the other side*. In a path-based system
+you can always name `/etc/shadow` and be told no; the name exists whether you
+may use it or not. Here, an object you were not given is not forbidden, it is
+**unsayable**. That difference is the whole point of the design.
+
+**Validating pointers is a graph query.** When a program passes a pointer, the
+kernel must check the program actually owns that memory before touching it. In
+Bramble that check walks the caller's own `Maps` edges — asking the authority on
+what is mapped, rather than a copy of it:
+
+```
+[user] a pointer into the kernel's half was refused
+```
+
+**Names mint capabilities.** `lookup("console")` requires a capability to the
+root carrying `Lookup`, and returns a *new capability* in a fresh slot. A name
+is not a way to reach something you could not otherwise reach; it is a
+convenience for something you were already permitted to ask for.
+
+**And the program can read the entire kernel.** One `inspect` call copies the
+whole graph into the program's buffer, which it decodes itself:
+
+```
+[user] inspect: 2368 bytes, seq 1120359, 21 nodes, 41 edges, 117413 of 123114 frames free
+[user] nodes: 1xRoot 1xCpu 1xProcess 2xThread 2xAddressSpace 13xMemoryObject 1xDevice
+[user] edges: 20xOwns 4xHolds 1xInSpace 6xMaps 1xReady 9xNamed
+```
+
+2368 bytes for the complete state of an operating system. Not a `/proc` view of
+one subsystem; every process, thread, address space, mapping, capability and
+name, joined, in one buffer, obtained with one call.
+
+### Killing a process, and why the ownership tree earns its keep here
+
+The second program writes through a null pointer on purpose:
+
+```
+*** killing a process: page fault at 0x0 from ring 3 ***
+  rip 0x40003d  cause PageFaultErrorCode(CAUSED_BY_WRITE | USER_MODE)
+proc: a process died mid-instruction and the graph is still consistent
+proc: free frames 117413 before, 117413 after two processes lived and died
+```
+
+The handler's entire response is `begin_delete(process)` — detach one edge. The
+address space, its page tables, its memory objects, its threads and their
+kernel stacks are all owned by that process, directly or transitively, so they
+become unreachable at once and the reaper returns them later.
+
+There is no cleanup function. There is no list of things to remember to free.
+There is no "did we get everything?" — the frame count answers that, and it does.
+
+A conventional kernel has an explicit teardown path for process exit, it is long,
+and it is where leaks live, because it must enumerate by hand what the ownership
+tree here states structurally.
+
+### Six bugs, and what they were about
+
+Every one was in conventional machinery. Not one was in the graph.
+
+**1. The kernel ran on an address space it had already destroyed.** After
+killing a process the scheduler switched to a kernel thread, which has no
+address space of its own, so `cr3` was left pointing at the dead process's page
+tables. The reaper then freed those frames. The allocator handed one straight
+back as the next process's page-table root, and zeroing it wiped out the
+mappings of the code doing the zeroing.
+
+The machine stopped with no output, which is the worst kind of bug. The fix is
+one line — a thread with no address space runs in the kernel's — and the lesson
+is that "whose page tables am I on right now?" is a question a kernel must be
+able to answer at every instant.
+
+**2. A program's own system call destroyed the pointer it was about to use.**
+The entry stub saved only the two registers the `syscall` instruction itself
+clobbers. But the kernel's handler is an ordinary compiled function, and treats
+six more as scratch. The user's compiler, reasonably, kept a live pointer in one
+of them across the call.
+
+The symptom was a fault at `0x00007fff00403491` — the top half of a stack
+address and the bottom half of a read-only-data address, spliced together. The
+kind of value that means a register you trusted was not what you thought.
+
+This is why calling conventions are documented down to the register. Bramble's
+is now written down in `abi/src/lib.rs`: only `rcx` and `r11` are clobbered, and
+the stub saves the rest.
+
+**3. A kernel stack overflow that failed completely silently.** A helper that
+copies an adjacency list into a fixed buffer returns 2 KiB *by value*, and the
+`lookup` path used three of them. With 16 KiB of kernel stack, that overflowed.
+
+Kernel stacks live in the direct map — one big mapping of all physical memory —
+so there is no unmapped guard page below them to fault on. The overflow walked
+into whatever memory happened to be next and the machine stopped.
+
+Three fixes: read-only walks use the borrowing iterator and copy nothing, stacks
+are 32 KiB, and every kernel stack now carries a **canary** — a known value at
+the very bottom, checked by the same consistency pass that checks everything
+else. An overflow is now a named error rather than a mystery.
+
+**4. `swapgs` cannot be paired correctly with Rust's interrupt handlers.** The
+standard trick requires that *every* entry from ring 3 swaps and *every* exit
+unswaps. Rust's `x86-interrupt` calling convention generates its own prologue,
+so a handler written in it cannot swap before the compiler's code runs. A timer
+arriving during user code left the two bases crossed, after which the next
+system call read its stack pointer from address zero.
+
+v1 drops `gs` entirely: with one core there is no "per-core" anything, so the
+stub reads two fixed addresses. Written down as debt — SMP brings the problem
+back and needs hand-written interrupt stubs that swap conditionally on the saved
+code segment.
+
+**5. Two ELF segments sharing a page.** The linker put a small table between two
+segments so that one page contained the end of a read-only segment and the start
+of a writable one. Bramble maps one `Maps` edge per segment, and two edges
+covering the same virtual page violates invariant I7 — correctly, since the
+hardware has only one set of permission bits per page.
+
+Several attempts to make the linker page-align things failed, because that table
+is synthesised *after* any linker script has had its say. So the loader was
+fixed instead: it computes a protection for each *page* as the union of every
+segment touching it, then groups consecutive pages that agree. A real dynamic
+loader makes exactly this trade for exactly this reason.
+
+**6. A fault while printing deadlocked the fault handler.** Three of the bugs
+above presented as "the machine stops with no output", partly because a fault
+taken while the serial lock was held made the crash reporter wait on the code it
+was reporting on. The crash paths now break those locks first. Linux calls the
+same trick `bust_spinlocks`, and it exists for the same reason.
+
+### The thing worth taking away
+
+Phase 5 was the buggiest phase by a wide margin, and the pattern is consistent
+with the previous four: **the graph has caused no bugs. The conventional
+machinery around it has caused all of them.**
+
+That is not an argument that the design is free. It costs memory, and it costs a
+measurable if small amount of time. But five phases in, the "everything is a
+graph" part has been the boring, reliable part, and the register-saving,
+`swapgs`-pairing, stack-sizing, page-table-lifetime parts — the parts every
+kernel has — have been where the difficulty lives.
+
+---
+
+## What is next
+
+Phase 6 is IPC: two processes exchanging messages over an endpoint, with the
+`Waiting` edge flipping between them in the graph as they rendezvous. It carries
+the last performance gate, and it is the last point at which the representation
+could still change without rewriting userspace.
