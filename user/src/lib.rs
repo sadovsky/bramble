@@ -121,6 +121,12 @@ pub fn endpoint_create() -> i64 {
     unsafe { syscall(abi::SYS_ENDPOINT, 0, 0, 0, 0) }
 }
 
+/// Ask the kernel to verify its own invariants. Zero means everything holds.
+pub fn check() -> i64 {
+    // SAFETY: no pointer arguments.
+    unsafe { syscall(abi::SYS_CHECK, 0, 0, 0, 0) }
+}
+
 /// The cycle counter. Under emulation this is not real cycles, so only ratios
 /// between measurements taken the same way mean anything.
 #[inline]
@@ -209,6 +215,25 @@ macro_rules! print {
 macro_rules! println {
     () => ($crate::print!("\n"));
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
+}
+
+/// Write a byte slice to the console as hexadecimal, in lines of 32 bytes.
+///
+/// The serial port is the only way anything leaves this machine, so a binary
+/// snapshot has to be spelled out. `tools/graphdump.py` reads it back.
+pub fn dump_hex(label: &str, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    println!("--- snapshot begin {} bytes={} ---", label, bytes.len());
+    let mut line = [0u8; 65];
+    for chunk in bytes.chunks(32) {
+        for (i, b) in chunk.iter().enumerate() {
+            line[i * 2] = HEX[(b >> 4) as usize];
+            line[i * 2 + 1] = HEX[(b & 0xf) as usize];
+        }
+        line[chunk.len() * 2] = b'\n';
+        write(console(), &line[..chunk.len() * 2 + 1]);
+    }
+    println!("--- snapshot end ---");
 }
 
 /// Render a rights bitmask the way the kernel's own dump does.

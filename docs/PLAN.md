@@ -707,3 +707,82 @@ named now. `spawn` was still starting the thread it created, which made
 catches rather than letting through. And the benchmarks in phases 4 and 6 now
 scale themselves down in debug builds, where the gates are not enforced anyway
 and a full boot was taking minutes.
+
+### Phase 8: v1, the inspectable kernel — **done**
+
+The snapshot format of DESIGN 5.4, the tools that read it, and a system call
+that lets any program ask the kernel to prove it is consistent.
+
+**The format.** A header carrying the non-graph register (free frames, ticks,
+the mutation counter), a node table, an adjacency table, and an edge table.
+Edges are emitted grouped by source and then by kind, and the adjacency table
+says where each node's group begins — a compressed sparse row, so a reader gets
+a usable index for free and never searches. Within a group the order is list
+order rather than sorted by target, because for `Ready` and `Waiting` that order
+*is* the queue and sorting it would discard the most interesting thing in the
+snapshot.
+
+`Running` is emitted as a **virtual edge**, flagged. It is a field on the cpu
+rather than an edge, for the reason DESIGN 5.3 gives, and reporting it anyway is
+what makes a snapshot the whole of the kernel's state rather than the whole of
+its edge set.
+
+**The milestone.** A user program, `v1`, holding a console and the root with
+`Lookup` and nothing else:
+
+```
+[v1] the kernel checked its own invariants at my request: all hold
+[v1] two workers running, reachable on slots 6 and 8
+--- snapshot begin quiet bytes=5984 ---
+--- snapshot begin one-worker-woken bytes=5984 ---
+[v1] still consistent after two snapshots
+```
+
+and on the host:
+
+```
+read 2 inspect snapshot(s); using 'one-worker-woken': 50 nodes, 98 edges
+  offline checker agrees with the kernel: all invariants hold
+  between 'quiet' and 'one-worker-woken':
+  + edge Ready Cpu#0.1 -> Thread#1.17
+  - edge Waiting Thread#1.17 -> Endpoint#1.7 recv
+```
+
+Two snapshots one message apart, and the difference is exactly one thread
+moving from a wait queue to the run queue. `build/v1.png` draws it: the root's
+ownership tree, three processes with their capabilities, address spaces, the
+endpoints with a thread parked on one, the cpu's ready list, and the running
+thread as a dashed virtual edge.
+
+**`tools/graphdump.py`** decodes both the kernel's text dump and the binary
+snapshot, checks the invariants offline, renders with Graphviz, diffs two
+snapshots, and answers the take-grant question. `scripts/smoke.sh` runs the
+check and the diff on every boot, so a disagreement between the in-kernel
+checker and the host one fails the build.
+
+**What the reachability query found.** Asked whether a worker could ever obtain
+a capability to the root, the answer is **yes** — not because the worker holds
+anything, but because `v1` holds the root with `Lookup` and holds the worker
+with `Grant`, so it could pass it along. Asked whether the same worker could
+ever obtain a capability to a thread, the answer is **no**: threads are neither
+named nor held by anyone, so no sequence of grants reaches one.
+
+Both answers are correct, and the first is the more useful. It says that
+**holding the root with `Lookup` is close to unlimited authority**, because the
+whole namespace is reachable through it, and that a child spawned by such a
+process is not confined from it. That is a real property of this configuration,
+found by asking rather than by reasoning, and it is the argument for the
+per-process namespaces DESIGN 6.1 anticipates: a program should be handed the
+names it needs, not the root.
+
+**Risk retired:** none remaining for v1. Snapshot consistency under the lock is
+the one engineering concern left, and at fifty nodes it does not bite.
+
+---
+
+## v1 is reached
+
+The goal, from the top of this document: *two userspace processes running
+preemptively, communicating over an IPC edge, with the entire kernel state
+inspectable as a graph via a syscall.* All four clauses hold, and the boot
+proves each of them every time.

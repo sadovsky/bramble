@@ -294,8 +294,14 @@ extern "C" fn kmain() -> ! {
     println!();
     dump::dump_graph();
 
+    // ---- phase 8: v1 ----
     println!();
-    cprintln!(fb::ACCENT, "phase 7 complete. halting.");
+    selftest::v1(modules);
+    println!();
+    dump::dump_graph();
+
+    println!();
+    cprintln!(fb::ACCENT, "phase 8 complete. v1 reached. halting.");
     halt_forever();
 }
 

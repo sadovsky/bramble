@@ -1354,3 +1354,183 @@ Phase 8 is v1: the final snapshot format, and the host tools that decode it,
 draw the whole system, diff two snapshots, and answer "could this process ever
 reach that object?" — the take-grant question from 1977, asked of a running
 kernel.
+
+---
+
+## Entry 9 — Phase 8: v1, and the whole kernel as bytes
+
+**Milestone: an unprivileged program hands the entire state of the operating
+system to the outside world, twice, and a tool on the host draws it, checks it,
+diffs it, and answers a question about it that no conventional kernel can be
+asked.**
+
+### What v1 was supposed to be
+
+From the first day, before any code: *two userspace processes running
+preemptively, communicating over an IPC edge, with the entire kernel state
+inspectable as a graph via a syscall.*
+
+All four clauses now hold, and the boot proves each of them every time.
+
+### The concepts
+
+**A snapshot format.** The kernel's state has to leave the machine somehow. The
+obvious approach is a text dump, which is what phase 2 built, but text is slow
+to produce and lossy to parse. The real interface is binary: a header, a table
+of nodes, a table of edges, laid out so a reader can use it directly.
+
+**Compressed sparse row.** The classic way to store a sparse graph. Instead of a
+list of (source, target) pairs you sort the edges by source and keep an index
+saying where each source's run of edges begins. A reader wanting "everything out
+of node 7" reads one index entry and takes a slice — no searching. Bramble's
+snapshot is exactly this, and `DESIGN.md` chose it as the export format back in
+section 3.4, when the live representation was being decided.
+
+One deviation, and it is deliberate. Within a node's group, edges are in **list
+order**, not sorted by target. For `Ready` and `Waiting` that order *is* the
+queue: sorting it would throw away the most interesting thing in the snapshot.
+
+**Virtual edges.** "Which thread is running?" is a field on the cpu, not an
+edge, because making it an edge would cost two list splices on every context
+switch. That was a stated compromise in the design. But a snapshot that omits it
+is not "the whole state", so it is emitted as an edge and **flagged as virtual**.
+The picture shows it as a dashed line. The compromise is visible rather than
+hidden, which is the difference between a principled exception and a hole.
+
+### The result
+
+`v1` is an ordinary program. It holds a console and the root with `Lookup`, and
+nothing else. It spawns two workers, talks to them, and then:
+
+```
+[v1] the kernel checked its own invariants at my request: all hold
+--- snapshot begin quiet bytes=5984 ---
+--- snapshot begin one-worker-woken bytes=5984 ---
+```
+
+Five thousand nine hundred and eighty-four bytes: fifty nodes, ninety-eight
+edges, the complete state of an operating system, obtained with one system call
+by a program with no special privilege.
+
+On the host:
+
+```
+  offline checker agrees with the kernel: all invariants hold
+  between 'quiet' and 'one-worker-woken':
+  + edge Ready Cpu#0.1 -> Thread#1.17
+  - edge Waiting Thread#1.17 -> Endpoint#1.7 recv
+```
+
+Two snapshots, one message apart, and the difference is *exactly* one thread
+moving from a wait queue to the run queue. Not "some counters changed" — the
+precise structural consequence of one message being sent.
+
+### The question a conventional kernel cannot be asked
+
+The tool implements the take-grant safety query from 1977. Current authority is
+one edge; **potential** authority is the closure of every way a capability can
+move:
+
+- what a process already holds;
+- anything named, if it holds the root with `lookup`;
+- anything obtainable by a process it can receive from, when that process can
+  also grant over the same endpoint;
+- anything its parent could obtain, if the parent may grant into it.
+
+Asked of the running system:
+
+```
+Process#0.11 COULD obtain a capability to Root#0.1
+Process#0.11 could never obtain a capability to Thread#0.9
+```
+
+The second answer shows the query is not vacuous: threads are neither named nor
+held by anyone, so no sequence of grants reaches one.
+
+The first is more interesting, and it is a finding rather than a demonstration.
+The worker holds nothing but a console and two endpoints. It could nonetheless
+obtain the root — because `v1` holds the root with `Lookup`, and holds the
+worker with `Grant`, and could therefore pass it along.
+
+That is true, and it says something worth knowing: **holding the root with
+`Lookup` is close to unlimited authority**, since the whole namespace is
+reachable through it, and a child spawned by such a process is not confined
+from it. Nobody reasoned their way to that; the tool was asked and it answered.
+The fix is the per-process namespace the design already anticipated — hand a
+program the names it needs rather than the root — and now there is a way to
+check whether the fix worked.
+
+This is the payoff the whole project was for. Not that the query is clever: it
+is a fixed-point computation over a few hundred edges, forty lines of Python.
+The point is that **it can be written at all**. It needs a structure that
+describes every object, every capability, every channel and every parentage in
+one place, with the rules for how authority moves stated over that structure. A
+conventional kernel has none of that, not because nobody wanted it, but because
+the state is scattered across four unrelated systems that were never designed to
+be joined.
+
+### What the picture shows
+
+`build/v1.png`, drawn from the snapshot with no kernel involvement:
+
+- the root, and the `Owns` tree hanging off it — every process, thread, address
+  space and page of memory in the system, in one tree;
+- three processes with dashed red `Holds` edges to exactly what each may touch,
+  labelled with rights and slot numbers;
+- the cpu, with a blue `Ready` edge to each queued thread and a dashed orange
+  `Running (virtual)` edge to the one executing;
+- a thread parked on an endpoint with a dotted `Waiting recv` edge;
+- address spaces, and the memory objects mapped into them.
+
+`ps`, `/proc/PID/maps`, `lsof`, a wait-channel dump and a capability audit, in
+one image, joined, from one call.
+
+---
+
+## Looking back over eight phases
+
+**The graph caused no bugs.** Not one. Every bug in this log was in the
+conventional machinery: a register the system-call stub failed to preserve, a
+global where a per-thread slot was needed, a kernel stack sized by guesswork, a
+`cr3` left pointing at freed page tables, `swapgs` that cannot be paired with
+Rust's interrupt prologue, two ELF segments sharing a page.
+
+**The checker earned its place three times over.** It found three real bugs in
+its first minute of existence, including a deadlock the plan expected to meet
+six phases later. It caught a refactoring mistake in phase 7 as an illegal state
+transition. And it runs on both sides of the system-call boundary now, so the
+kernel and the host have to agree.
+
+**But invariants are not correctness.** Phase 4 leaked memory while every
+invariant held: stacks were hung off the root rather than off their threads, and
+the bookkeeping was perfectly coherent and simply untrue. A dumb before-and-after
+frame count caught what the clever machinery could not. Both kinds of check
+earn their keep, and they catch different things.
+
+**Every performance fix was removing repetition, not removing structure.** The
+round-robin doing ten writes where one would do. `precheck_link` and `link_raw`
+validating the same thing twice. `unlink` re-deriving endpoint kinds the edge
+kind already fixed. The graph was never slow; it was just asked to do the same
+work several times. After those fixes it costs 3% of a context switch and 8% of
+an IPC round trip, and the second figure is an upper bound on a cost any kernel
+pays some of.
+
+**The design's honesty held up.** `DESIGN.md` pushed back on four of the
+original brief's ideas before any code existed, and every one of those pushbacks
+turned out to matter: transitive authority would have made confinement
+impossible; traversal-based scheduling would have been fatal on the fast path;
+reachability-based cleanup would have needed a garbage collector; handles as
+nodes would have cost a hop per system call for nothing. The compromises it
+listed in section 5.3 are all still there, all still listed, and the one that
+was hardest to hold — page tables as a cache of `Maps` edges — is checked in both
+directions on every boot.
+
+**What it cost.** About 8x the memory per relationship. A measurable but small
+amount of time. Fixed arena sizes. No POSIX, ever. And a persistence story that
+does not exist and should not be started as a weekend project.
+
+Whether that trade is worth it depends on what you want from a kernel. If you
+want to run existing software fast, obviously not. If you want a system whose
+entire state can be handed to a program, drawn, checked, diffed, and asked
+questions about that a conventional kernel cannot express — then eight phases in,
+the answer looks like yes.

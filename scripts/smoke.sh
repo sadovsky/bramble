@@ -68,9 +68,13 @@ print('build/screen.png written')
 " || true
 fi
 
-# If the boot emitted a graph dump, verify it offline and draw it. The kernel
-# and the host tool check the same invariants from opposite sides.
-if grep -q -- "--- graph begin" build/serial.log 2>/dev/null; then
+# Decode whatever state left the machine and verify it offline. The kernel and
+# the host tool check the same invariants from opposite sides, so a
+# disagreement fails the build.
+if grep -q -- "--- snapshot begin" build/serial.log 2>/dev/null; then
+    python3 tools/graphdump.py build/serial.log --check --diff \
+        --dot build/graph.dot --png build/graph.png || exit 1
+elif grep -q -- "--- graph begin" build/serial.log 2>/dev/null; then
     python3 tools/graphdump.py build/serial.log --check \
         --dot build/graph.dot --png build/graph.png || exit 1
 fi

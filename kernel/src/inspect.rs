@@ -117,13 +117,42 @@ fn edge_record(g: &Graph, eid: bramble_graph::id::EdgeId) -> EdgeRecord {
     r
 }
 
-/// Write a snapshot into `buf`, returning the bytes used. The caller must have
-/// checked the buffer is large enough.
+/// How many virtual edges this snapshot will carry (DESIGN 5.4).
+pub fn virtual_edge_count(g: &Graph) -> u32 {
+    let mut n = 0;
+    for id in g.live_nodes() {
+        if id.kind() == Some(NodeKind::Cpu) {
+            if let Some(c) = g.typed::<Cpu>(id).and_then(|c| g.body(c)) {
+                if !c.current.is_null() {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Bytes a snapshot of the current graph needs.
+pub fn snapshot_size(g: &Graph) -> usize {
+    inspect_size(g.node_count(), g.edge_count() + virtual_edge_count(g))
+}
+
+/// Write a snapshot into `buf`, returning the bytes used.
+///
+/// Edges are emitted grouped by source node and then by kind, and an adjacency
+/// table says where each node's group starts. That is DESIGN 5.4's compressed
+/// sparse row: a reader gets a usable index for free and never has to search.
+/// Within a group the order is list order, not sorted by target, because for
+/// `Ready` and `Waiting` that order *is* the queue and losing it would throw
+/// away the most interesting thing in the snapshot.
 pub fn write_snapshot(g: &Graph, buf: &mut [u8]) -> usize {
     let nodes = g.node_count();
-    let edges = g.edge_count();
+    let virtuals = virtual_edge_count(g);
+    let edges = g.edge_count() + virtuals;
     let node_offset = core::mem::size_of::<InspectHeader>();
-    let edge_offset = node_offset + nodes as usize * core::mem::size_of::<NodeRecord>();
+    let adjacency_offset = node_offset + nodes as usize * core::mem::size_of::<NodeRecord>();
+    let edge_offset =
+        adjacency_offset + nodes as usize * core::mem::size_of::<AdjacencyEntry>();
     let total = edge_offset + edges as usize * core::mem::size_of::<EdgeRecord>();
     if buf.len() < total {
         return 0;
@@ -140,23 +169,58 @@ pub fn write_snapshot(g: &Graph, buf: &mut [u8]) -> usize {
             node_count: nodes,
             edge_count: edges,
             node_offset: node_offset as u32,
+            adjacency_offset: adjacency_offset as u32,
             edge_offset: edge_offset as u32,
+            _reserved: 0,
             total_frames: root.map(|r| r.total_frames).unwrap_or(0),
             free_frames: root.map(|r| r.free_frames).unwrap_or(0),
             ticks: root.map(|r| r.ticks).unwrap_or(0),
         },
     );
 
-    let mut at = node_offset;
+    let mut node_at = node_offset;
+    let mut adj_at = adjacency_offset;
+    let mut edge_at = edge_offset;
+    let mut emitted = 0u32;
+
     for id in g.live_nodes() {
-        write_at(buf, at, node_record(g, id));
-        at += core::mem::size_of::<NodeRecord>();
+        write_at(buf, node_at, node_record(g, id));
+        node_at += core::mem::size_of::<NodeRecord>();
+
+        let first = emitted;
+        for k in 0..bramble_graph::id::N_EDGE_KINDS {
+            let kind = EdgeKind::from_u8(k as u8).expect("kind in range");
+            for eid in g.out_edges(id, kind) {
+                write_at(buf, edge_at, edge_record(g, eid));
+                edge_at += core::mem::size_of::<EdgeRecord>();
+                emitted += 1;
+            }
+        }
+        // The one relationship the kernel keeps as a field rather than an edge,
+        // reported as an edge and flagged as such.
+        if id.kind() == Some(NodeKind::Cpu) {
+            if let Some(c) = g.typed::<Cpu>(id).and_then(|c| g.body(c)) {
+                if !c.current.is_null() {
+                    write_at(
+                        buf,
+                        edge_at,
+                        EdgeRecord {
+                            src: id.0,
+                            dst: c.current.0,
+                            kind: EDGE_KIND_RUNNING,
+                            flags: EDGE_FLAG_VIRTUAL,
+                            ..EdgeRecord::default()
+                        },
+                    );
+                    edge_at += core::mem::size_of::<EdgeRecord>();
+                    emitted += 1;
+                }
+            }
+        }
+        write_at(buf, adj_at, AdjacencyEntry { first, count: emitted - first });
+        adj_at += core::mem::size_of::<AdjacencyEntry>();
     }
-    let mut at = edge_offset;
-    for eid in g.live_edges() {
-        write_at(buf, at, edge_record(g, eid));
-        at += core::mem::size_of::<EdgeRecord>();
-    }
+
     let _: Option<Ref<Root>> = None;
     total
 }

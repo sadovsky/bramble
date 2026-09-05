@@ -211,6 +211,7 @@ extern "C" fn dispatch(a0: u64, a1: u64, a2: u64, _a3: u64, nr: u64) -> i64 {
         SYS_START => sys_start(a0),
         SYS_KILL => sys_kill(a0),
         SYS_ENDPOINT => sys_endpoint(),
+        SYS_CHECK => sys_check(),
         _ => E_BADCALL,
     }
 }
@@ -564,10 +565,22 @@ fn sys_recv(ep_slot: u64, words_ptr: u64) -> i64 {
     }
 }
 
+/// Run the kernel's own consistency check on demand.
+///
+/// Exposing this to userspace is the point of having one structure with stated
+/// rules: any program can ask the kernel to prove it is internally consistent,
+/// and get an answer rather than a promise.
+fn sys_check() -> i64 {
+    match crate::state::check_now() {
+        Ok(()) => 0,
+        Err(_) => E_BADKIND,
+    }
+}
+
 /// The whole kernel state, into a user buffer.
 fn sys_inspect(ptr: u64, len: u64) -> i64 {
     let g = GRAPH.lock();
-    let needed = inspect_size(g.node_count(), g.edge_count());
+    let needed = crate::inspect::snapshot_size(&g);
     if (len as usize) < needed {
         return needed as i64;
     }

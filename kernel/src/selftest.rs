@@ -813,3 +813,58 @@ pub fn lifecycle(modules: &[&limine::file::File]) {
         "life: a program made processes, endpoints and grants, and left no trace"
     );
 }
+
+// ---------------------------------------------------------------- phase 8 ---
+
+/// Phase 8: the v1 goal. Two userspace processes running preemptively,
+/// communicating over an endpoint, with the whole kernel state readable by a
+/// program that holds nothing special.
+pub fn v1(modules: &[&limine::file::File]) {
+    let (root, console, root_id) = {
+        let g = GRAPH.lock();
+        let boot = crate::state::BOOT.lock();
+        (g.root().expect("root"), boot.console, boot.root)
+    };
+    let before = census();
+    let boot = crate::sched::adopt_boot_thread(root).expect("boot thread");
+
+    let elf = find_module(modules, "v1").expect("the v1 module is missing");
+    x86_64::instructions::interrupts::enable();
+
+    let v1 = crate::proc::spawn(
+        crate::proc::Owner::Root(root),
+        elf,
+        &[(console, Rights::READ.union(Rights::WRITE)), (root_id, Rights::LOOKUP)],
+    )
+    .unwrap_or_else(|e| panic!("could not spawn v1: {}", e.describe()));
+    crate::proc::start(v1).expect("start v1");
+    state::assert_consistent("after spawning v1");
+
+    let deadline = crate::time::ticks() + 9000;
+    let mut rounds = 0u32;
+    while GRAPH.lock().is_live(v1.id()) {
+        crate::sched::yield_now();
+        rounds += 1;
+        if rounds.is_multiple_of(64) {
+            reaper::drain();
+            assert!(crate::time::ticks() < deadline, "v1 never finished");
+        }
+    }
+    x86_64::instructions::interrupts::disable();
+    reaper::drain();
+    state::assert_consistent("after v1 exited");
+
+    {
+        let mut g = GRAPH.lock();
+        g.begin_delete(boot.id()).expect("delete boot thread");
+        if let Some(cpu) = g.typed::<Cpu>(crate::state::cpu0()) {
+            if let Some(b) = g.body_mut(cpu) {
+                b.current = NodeId::NULL;
+            }
+        }
+    }
+    reaper::drain();
+    let after = census();
+    assert_eq!(before, after, "v1 left something behind");
+    cprintln!(fb::ACCENT, "v1:   the whole kernel left the machine as bytes, twice");
+}
