@@ -266,3 +266,58 @@ Not part of v1. Listed so the v1 design does not paint itself out of them.
    parentage proves too rigid.
 6. **Persistence**, only after a separate design document. Do not start it
    as a weekend project.
+
+---
+
+## Build log
+
+Recorded as phases land, so the go/no-go gates have real numbers attached.
+
+### Phase 1: the graph crate, on the host — **done**
+
+`cargo test -p bramble-graph` runs 24 tests including two randomised property
+suites that call the checker after every operation. `bramble-graph` is
+`no_std`, `forbid(unsafe_code)`, and allocates nothing.
+
+Measured on the host in release (`cargo test --release -- --nocapture bench`):
+
+| Operation | ns/op |
+|---|---|
+| `resolve` (handle to object, with rights check) | 5.5 |
+| header lookup (id to node) | 3.1 |
+| `pick_next` (run-queue head) | 3.1 |
+| `rotate_ready` (round robin) | 6.9 |
+| `link` + `unlink` pair | 49.9 |
+| full checker, 69 nodes / 261 edges | 8130 |
+
+Fast path against graph size: 8.76 ns on a 2-thread graph, 8.98 ns on a
+100-thread, 200-capability graph. A ratio of 1.03, which is the property that
+actually matters.
+
+Static footprint: `Edge` 64 bytes, `NodeHeader` 80, `NodeId` 8, whole `Graph`
+429 KiB of `.bss`.
+
+**Verdict: go.** Every primitive is single-digit nanoseconds and none scales
+with graph size.
+
+**What the checker caught, in its first three runs.** All three are the bug
+class DESIGN 5.3 predicted would dominate: a derived index diverging from the
+edge it shadows.
+
+1. **A stale `cr3` cache.** Nothing enforced that a thread has at most one
+   `InSpace` edge, so a second one left the hot-hop cache pointing at the first
+   address space. Fixed by making `InSpace` replace rather than accumulate, and
+   by adding cardinality checks for every single-valued relationship.
+2. **A thread blocked forever on a destroyed endpoint.** Reaping an endpoint
+   unlinked its `Waiting` in-edges and left the thread `Blocked` with no edge.
+   This is the deadlock the phase 7 milestone was meant to find, surfacing six
+   phases early. Fixed with explicit abort semantics: the reaper reports the
+   stranded thread and the kernel resumes it with an error.
+3. **A half-applied state transition.** `make_blocked` unlinked the thread's
+   run-queue edge and then failed to link the wait edge because the endpoint was
+   already dying, leaving the thread `Ready` with nothing to run it. Fixed with
+   `precheck_link`, so every multi-step transition validates before it mutates.
+
+The lesson is the one the design predicted, and it is worth restating: the
+graph's own structure was never the problem. Every bug was a cache, and the
+checker found all three within seconds of existing.
