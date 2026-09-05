@@ -5,7 +5,7 @@
 //! before the allocator does (DESIGN 3.7).
 
 use bramble_graph::body::*;
-use bramble_graph::edge::{MapsAttr, Prot};
+use bramble_graph::edge::{MapFlags, MapsAttr, Prot};
 use bramble_graph::checker::Checker;
 use bramble_graph::graph::{Graph, Ref};
 use bramble_graph::id::NodeId;
@@ -234,6 +234,7 @@ pub fn populate(
             len_pages: total_frames as u32,
             off_pages: 0,
             prot: Prot::READ.union(Prot::WRITE),
+            flags: MapFlags::NONE,
         },
     )?;
     if let Some(img) = g.typed::<MemoryObject>(boot.kernel_image) {
@@ -246,6 +247,7 @@ pub fn populate(
                 len_pages: pages,
                 off_pages: 0,
                 prot: Prot::READ.union(Prot::WRITE).union(Prot::EXEC),
+                flags: MapFlags::NONE,
             },
         )?;
     }

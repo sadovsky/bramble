@@ -8,7 +8,7 @@
 
 use bramble_abi as abi;
 use bramble_graph::body::*;
-use bramble_graph::edge::{MapsAttr, Prot};
+use bramble_graph::edge::{MapFlags, MapsAttr, Prot};
 use bramble_graph::graph::Ref;
 
 use crate::elf::{self, PF_R, PF_W, PF_X};
@@ -48,6 +48,7 @@ fn graph_reason(e: bramble_graph::graph::GraphError) -> &'static str {
         E::NameTooLong => "graph: name does not fit inline",
         E::RootExists => "graph: a root already exists",
         E::BadState => "graph: illegal thread state transition",
+        E::TooManyMappings => "graph: the address space is full of mappings",
     }
 }
 
@@ -180,7 +181,7 @@ fn load_segments(
         vm::map(
             space,
             obj,
-            MapsAttr { vaddr, len_pages: pages, off_pages: 0, prot: Prot(prot[start]) },
+            MapsAttr { vaddr, len_pages: pages, off_pages: 0, prot: Prot(prot[start]), flags: MapFlags::NONE },
         )?;
         runs[run_count] = Run { vaddr, pages, phys };
         run_count += 1;
@@ -278,6 +279,7 @@ pub fn spawn(
             len_pages: USER_STACK_PAGES,
             off_pages: 0,
             prot: Prot::RWU,
+            flags: MapFlags::NONE,
         },
     )?;
     // Sixteen bytes of headroom, and the ABI's alignment at the entry point.

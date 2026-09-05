@@ -9,7 +9,7 @@
 
 use bramble_abi::*;
 use bramble_graph::body::{Device, NodeBody, Process, Rights, Thread};
-use bramble_graph::edge::{EdgeAttr, MapsAttr, NamedAttr, Prot};
+use bramble_graph::edge::{EdgeAttr, MapFlags, MapsAttr, NamedAttr, Prot};
 use bramble_graph::graph::Ref;
 use bramble_graph::id::{EdgeKind, NodeKind};
 
@@ -212,6 +212,9 @@ extern "C" fn dispatch(a0: u64, a1: u64, a2: u64, _a3: u64, nr: u64) -> i64 {
         SYS_KILL => sys_kill(a0),
         SYS_ENDPOINT => sys_endpoint(),
         SYS_CHECK => sys_check(),
+        SYS_MEM_CREATE => sys_mem_create(a0),
+        SYS_MAP => sys_map(a0, a1, a2, _a3),
+        SYS_UNMAP => sys_unmap(a0),
         _ => E_BADCALL,
     }
 }
@@ -562,6 +565,138 @@ fn sys_recv(ep_slot: u64, words_ptr: u64) -> i64 {
             slot as i64
         }
         Err(e) => e,
+    }
+}
+
+/// Allocate zeroed memory owned by the caller.
+///
+/// No special authority: memory a process allocates is owned by that process,
+/// charged to its subtree and freed when it dies, so the only limit that
+/// matters is already enforced by the ownership tree.
+fn sys_mem_create(pages: u64) -> i64 {
+    let proc = match caller() {
+        Some(p) => p,
+        None => return E_BADHANDLE,
+    };
+    if pages == 0 || pages > 4096 {
+        return E_NOSPACE;
+    }
+    let obj = match crate::vm::alloc_object_for(proc, pages as u32) {
+        Ok(o) => o,
+        Err(_) => return E_NOSPACE,
+    };
+    // Zero it before anyone can see it: memory that has been elsewhere must
+    // not arrive carrying what was there.
+    let (phys, n) = {
+        let g = GRAPH.lock();
+        match g.body(obj) {
+            Some(b) => (b.phys_base, b.pages as usize),
+            None => return E_BADHANDLE,
+        }
+    };
+    // SAFETY: frames just allocated for this object, reachable only from here.
+    unsafe {
+        core::ptr::write_bytes((crate::paging::hhdm() + phys) as *mut u8, 0, n * 4096);
+    }
+    let mut g = GRAPH.lock();
+    match g.grant(proc, obj, Rights::ALL) {
+        Ok(slot) => slot as i64,
+        Err(_) => E_NOSPACE,
+    }
+}
+
+/// Map memory into the caller's own address space.
+///
+/// Into its own, and no other: there is no argument naming a space, so this
+/// call cannot reach one. Mapping elsewhere would need a capability to that
+/// space, and nothing hands one out.
+fn sys_map(mem_slot: u64, vaddr: u64, prot_bits: u64, lazy: u64) -> i64 {
+    let proc = match caller() {
+        Some(p) => p,
+        None => return E_BADHANDLE,
+    };
+    if vaddr & 0xFFF != 0 || vaddr == 0 || vaddr >= 0x0000_8000_0000_0000 {
+        return E_FAULT;
+    }
+    let (space, obj, pages) = {
+        let g = GRAPH.lock();
+        let id = match g.resolve(proc, mem_slot as u32, Rights::MAP) {
+            Ok(id) => id,
+            Err(bramble_graph::graph::GraphError::MissingRights { .. }) => return E_PERM,
+            Err(_) => return E_BADHANDLE,
+        };
+        if id.kind() != Some(NodeKind::MemoryObject) {
+            return E_BADKIND;
+        }
+        let obj: Ref<bramble_graph::body::MemoryObject> = match g.typed(id) {
+            Some(o) => o,
+            None => return E_BADHANDLE,
+        };
+        let pages = match g.body(obj) {
+            Some(b) => b.pages,
+            None => return E_BADHANDLE,
+        };
+        let t: Ref<Thread> = match g.typed(crate::sched::current_locked(&g)) {
+            Some(t) => t,
+            None => return E_BADHANDLE,
+        };
+        match g.space_of(t) {
+            Some(s) => (s, obj, pages),
+            None => return E_BADHANDLE,
+        }
+    };
+
+    let mut prot = Prot::USER;
+    if prot_bits & 1 != 0 {
+        prot = prot.union(Prot::READ);
+    }
+    if prot_bits & 2 != 0 {
+        prot = prot.union(Prot::WRITE);
+    }
+    if prot_bits & 4 != 0 {
+        prot = prot.union(Prot::EXEC);
+    }
+    let flags = if lazy != 0 { MapFlags::LAZY } else { MapFlags::NONE };
+
+    match crate::vm::map(
+        space,
+        obj,
+        MapsAttr { vaddr, len_pages: pages, off_pages: 0, prot, flags },
+    ) {
+        Ok(_) => 0,
+        Err(crate::vm::VmError::Graph(bramble_graph::graph::GraphError::RangeOverlap)) => E_FAULT,
+        Err(crate::vm::VmError::Graph(
+            bramble_graph::graph::GraphError::TooManyMappings,
+        )) => E_NOSPACE,
+        Err(_) => E_NOSPACE,
+    }
+}
+
+/// Remove whatever mapping covers `vaddr` from the caller's address space.
+fn sys_unmap(vaddr: u64) -> i64 {
+    let proc = match caller() {
+        Some(p) => p,
+        None => return E_BADHANDLE,
+    };
+    let _ = proc;
+    let edge = {
+        let g = GRAPH.lock();
+        let t: Ref<Thread> = match g.typed(crate::sched::current_locked(&g)) {
+            Some(t) => t,
+            None => return E_BADHANDLE,
+        };
+        let space = match g.space_of(t) {
+            Some(s) => s,
+            None => return E_BADHANDLE,
+        };
+        match g.find_mapping(space, vaddr) {
+            Some((e, _)) => e,
+            None => return E_NOTFOUND,
+        }
+    };
+    match crate::vm::unmap(edge) {
+        Ok(()) => 0,
+        Err(_) => E_BADHANDLE,
     }
 }
 

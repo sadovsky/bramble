@@ -1534,3 +1534,138 @@ want to run existing software fast, obviously not. If you want a system whose
 entire state can be handed to a program, drawn, checked, diffed, and asked
 questions about that a conventional kernel cannot express — then eight phases in,
 the answer looks like yes.
+
+---
+
+## Entry 10 — Phase 9a: the thing the graph is bad at
+
+**Milestone: 512 pages mapped, three pages actually built, and a measurement
+showing why a graph needs help with one particular kind of question.**
+
+v1 was reached in the last entry. Everything from here is post-v1, and the
+natural place to start is the design's own list of weaknesses.
+
+### The admission
+
+`DESIGN.md` section 5.3 lists seven places where purity was traded for
+something. The last one is the least comfortable:
+
+> **Range queries are not native.** "Which mapping covers address v?" needs a
+> side index once lazy mapping exists.
+
+That is a real gap, and it is worth being precise about why. A graph relates
+**objects**: this process owns that memory, this thread waits on that endpoint.
+Adjacency lists answer "what is connected to this?" in one memory read.
+
+But a mapping is not an object relationship, it is an **interval**. Asking
+"which of this address space's mappings contains `0x50000000`?" is asking which
+of several ranges a point falls in. No adjacency list answers that, because
+adjacency is about identity and this question is about ordering. The only thing
+the graph can do unaided is look at every mapping in turn.
+
+### The concepts
+
+**A page fault** happens when a program touches an address with no valid
+translation. Until now Bramble treated every user fault as fatal: the design
+said so explicitly (assumption Q5, *"eager mapping in v1; a user page fault is
+always a fault"*), and phase 5 killed a program that wrote through a null
+pointer.
+
+But a fault is not necessarily an error. It can be the moment a mapping the
+kernel already promised gets *realised*. That is **demand paging**, and it is
+how every real system avoids doing work for memory nobody touches.
+
+**Lazy mapping**, the version built here: the `Maps` edge exists — the graph
+says the memory is there, the checker verifies it, a snapshot shows it — but no
+page-table entries are written. Each page's entry appears when that page is
+first touched.
+
+This fits the design's own framing rather neatly. Invariant I5 says *page tables
+are a cache of `Maps` edges*. A cache is allowed to be cold. So lazy mapping is
+not an exception to the invariant so much as a use of what the invariant already
+permits: the graph is the truth, and the hardware catches up.
+
+### What was built
+
+**The index.** Each address space now carries a small array of its own `Maps`
+edges, sorted by address. Maintained by the two operations that create and
+destroy those edges, and checked by the checker as invariant I11: same count as
+the edges, every entry live and belonging to this space, sorted, none missing.
+
+It is a derived index like the handle table and the page tables, and it goes on
+the same list in the design's non-graph register, with the same discipline: the
+edges are the truth, the index is a shortcut, and something verifies they agree.
+
+A pleasing side effect: the "do these two mappings overlap?" check used to scan
+every mapping. In a *sorted* list of disjoint ranges, a new range can only
+collide with its immediate neighbours, so it is now two comparisons.
+
+**Three system calls**, so a program manages its own memory: `mem_create`,
+`map`, `unmap`. `map` has no argument naming an address space, so it can only
+map into the caller's own. Mapping into someone else's would need a capability
+to their address space, and nothing in the system hands one out — which is not a
+check that had to be written, just a consequence of there being no way to say it.
+
+### The measurement
+
+The question worth answering is not "is the index fast" but "does it beat what
+the graph could do unaided". So the scan was kept, and both are measured. 20000
+lookups of the worst-case address:
+
+| Mappings | Indexed | Scanning |
+|---|---|---|
+| 1 | 137 | 137 |
+| 4 | 144 | 191 |
+| 16 | 182 | 512 |
+| 32 | 206 | 958 |
+
+The scan is linear: 7x the cost for 32x the mappings. The index is logarithmic:
+1.5x. They are exactly equal at one mapping — a binary search over one element
+is a comparison, same as a scan of one element — and the index is ahead from
+four onwards.
+
+That low crossover matters. This is not a structure that only pays off at scale,
+which would have been an argument for leaving it out of a hobby kernel. It pays
+off at four mappings, and a process has five before it does anything.
+
+### The result
+
+```
+[lazy] allocated 512 pages (2048 KiB) in slot 2
+[lazy] mapped all 512 pages at 0x50000000, lazily: no page-table entries yet
+[lazy] touched and verified 3 of 512 pages
+[lazy] kernel invariants still hold with the mapping half realised
+vm:   3 page faults served by filling in a lazy mapping
+```
+
+Three faults for 512 mapped pages. The phase asserts both ends of that: at least
+three, because the pages really were written and read back, and fewer than
+thirty-two, because otherwise nothing was lazy about it.
+
+### Being honest about what this isn't
+
+The frames are still allocated eagerly and contiguously. Only the *page-table
+work* is deferred. Real demand paging allocates the frame on the fault too, and
+that needs a `MemoryObject` able to describe a non-contiguous set of pages —
+which the design already lists as post-v1, and which changes the shape of a node
+rather than adding an index beside it. Copy-on-write needs that plus a reference
+count on frames.
+
+So this phase closed the *structural* gap — a range query now has a structure
+that answers it, checked like everything else — and left the *allocation*
+question for whenever non-contiguous memory objects get built.
+
+### The pattern, one more time
+
+Every phase since the fourth has ended the same way: the graph was not the
+problem, but it needed to be asked the right question in the right shape. The
+run queue needed an ordered adjacency list. The syscall path needed a slot
+table. The fault path needed the page tables. This one needed a sorted array.
+
+None of those are compromises of the thesis, and calling them that would be
+sloppy. The thesis is that **one typed graph is the kernel's source of truth**,
+not that no other data structure may exist. Every index here is derived from the
+graph, maintained by the operations that change the graph, and verified against
+the graph by a checker that runs on every boot. What the design refused to do
+was let any of them become a second, independent truth — and nine phases in,
+none of them has.

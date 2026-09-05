@@ -36,6 +36,7 @@ and diffed on the host. `scripts/check.sh` proves all of it on every run.
 | 6 | IPC over an endpoint, with capability transfer | done |
 | 7 | Lifecycle and naming from userspace | done |
 | 8 | v1: the inspectable kernel | done |
+| 9a | Lazy mapping and the address range index | done |
 
 ```
 cargo ktest             # graph crate tests, on the host

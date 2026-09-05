@@ -11,7 +11,7 @@ echo "==> clippy"
 cargo kclippy -- -D warnings
 cargo clippy -p bramble-kernel -- -D warnings
 
-WAIT_FOR="${1:-phase 8 complete}"
+WAIT_FOR="${1:-phase 9 complete}"
 
 echo "==> debug kernel, boot smoke test"
 ./scripts/build-iso.sh >/dev/null

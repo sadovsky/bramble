@@ -252,9 +252,9 @@ size) and a user buffer that is too small. Both are engineering, not design.
 
 Not part of v1. Listed so the v1 design does not paint itself out of them.
 
-1. **Lazy mapping and the per-space range index**, which also enables
-   demand-zero memory and copy-on-write `MemoryObject`s (a `Maps` edge
-   attribute plus a fault handler that consults the index, never the graph).
+1. ~~**Lazy mapping and the per-space range index**~~ — **done**, see the build
+   log below. Demand-zero and copy-on-write still need non-contiguous memory
+   objects, which is separate work.
 2. **Async notifications** as a bitmask on `Endpoint`, so an interrupt can
    signal a userspace driver without a blocked receiver.
 3. **Chunked slab growth** from the frame allocator.
@@ -786,3 +786,68 @@ The goal, from the top of this document: *two userspace processes running
 preemptively, communicating over an IPC edge, with the entire kernel state
 inspectable as a graph via a syscall.* All four clauses hold, and the boot
 proves each of them every time.
+
+### Phase 9a: lazy mapping and the range index — **done**
+
+The design's own list of compromises (DESIGN 5.3) ends with the least
+comfortable one: *"range queries are foreign. Anything keyed by address needs a
+side structure; the graph gives nothing for free here."* This phase builds that
+side structure and measures whether it earns its place.
+
+**The index.** Each `AddressSpace` carries `ranges`, the edge indices of its
+`Maps` edges sorted by virtual address. It is maintained by `link_maps` and
+`unlink` — the same two operations that create and destroy the edges it indexes
+— and audited by the checker as **invariant I11**: exactly as many entries as
+`Maps` edges, every entry live and belonging to this space, sorted, and no edge
+missing from it.
+
+It pays for itself twice over. The overlap check (I7) was a scan of every
+mapping; with a sorted index it is two comparisons, because a sorted list of
+disjoint ranges can only be disturbed by its immediate neighbours.
+
+**Lazy mapping.** A `Maps` edge may carry `LAZY`, meaning the edge exists and
+the page-table entries do not. The mapping is real the moment `map` returns: the
+graph says the memory is there, and the hardware is brought up to date one page
+at a time as pages are touched. Invariant I5 gains exactly one exemption for it
+— a lazy mapping may have no entry — and gains nothing in the other direction:
+an entry no mapping authorises is still a violation, with no exception at all.
+
+**Three new system calls**, so a program manages its own memory:
+`mem_create(pages)`, `map(slot, vaddr, prot, lazy)`, `unmap(vaddr)`. `map` takes
+no argument naming an address space, so it cannot reach one but the caller's
+own; mapping elsewhere would need a capability that nothing hands out.
+
+**Measured**, release build under TCG, 20000 lookups of the worst-case address:
+
+| Mappings | Indexed | Scanning |
+|---|---|---|
+| 1 | 137 | 137 |
+| 4 | 144 | 191 |
+| 16 | 182 | 512 |
+| 32 | 206 | 958 |
+
+The scan is linear, as it must be: 7x the cost for 32x the mappings. The index
+is logarithmic: 1.5x. They are identical at one mapping, and the index is ahead
+from four. That is the whole argument, and it is worth noting that the
+crossover is *low* — this is not a structure that only pays off at scale.
+
+**The milestone.** `lazy` allocates 512 pages, maps them all lazily, touches
+three, and reads them back:
+
+```
+[lazy] mapped all 512 pages at 0x50000000, lazily: no page-table entries yet
+[lazy] touched and verified 3 of 512 pages
+[lazy] kernel invariants still hold with the mapping half realised
+vm:   3 page faults served by filling in a lazy mapping
+```
+
+Three faults for 512 mapped pages. The phase asserts both bounds: at least
+three, because the pages really were touched, and fewer than thirty-two, because
+otherwise the mapping was not lazy at all.
+
+**What this does not do.** The frames are still allocated eagerly and
+contiguously; only the page-table work is deferred. Demand-*allocation* needs a
+`MemoryObject` that can describe a non-contiguous set of pages, which DESIGN 4.1
+already lists as post-v1 and which changes the shape of a node rather than
+adding an index. Copy-on-write needs the same thing plus a reference count on
+the frames. Both are the next step, not this one.

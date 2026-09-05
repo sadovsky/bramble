@@ -11,7 +11,7 @@
 //! it.
 
 use bramble_graph::body::*;
-use bramble_graph::edge::{EdgeAttr, MapsAttr, Prot};
+use bramble_graph::edge::{EdgeAttr, MapFlags, MapsAttr, Prot};
 use bramble_graph::graph::{Graph, GraphError, Ref};
 
 use bramble_graph::id::{EdgeId, EdgeKind, NodeId, NodeKind};
@@ -142,6 +142,13 @@ pub fn map(
             return Err(VmError::NoAllocator);
         }
     };
+    // A lazy mapping writes no entries at all. The edge is the mapping; the
+    // page tables are a cache of it (invariant I5), and a cache is allowed to
+    // be cold. `fault_in` fills it a page at a time.
+    if attr.flags.contains(MapFlags::LAZY) {
+        return Ok(edge);
+    }
+
     // SAFETY: `pml4` came from an AddressSpace node this kernel created, and
     // the range was just checked not to overlap an existing mapping.
     let r = unsafe { paging::map_pages(pml4, attr.vaddr, paddr, attr.len_pages, attr.prot, fa) };
@@ -167,6 +174,85 @@ pub fn unmap(edge: EdgeId) -> Result<(), VmError> {
     unsafe { paging::unmap_pages(pml4, attr.vaddr, attr.len_pages) };
     g.unlink(edge)?;
     Ok(())
+}
+
+/// How many faults have been served by filling in a lazy mapping.
+pub static LAZY_FAULTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Cycles spent inside `find_mapping`, and how many lookups that covers.
+pub static LOOKUP_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Try to satisfy a page fault by filling in one page of a lazy mapping.
+///
+/// This is the question DESIGN 5.3 admits the graph cannot answer on its own:
+/// *which mapping covers this address?* It is a range query, and adjacency
+/// lists relate objects rather than intervals. The answer is the range index —
+/// a binary search over the space's `Maps` edges, kept sorted by the same two
+/// operations that create and destroy them.
+///
+/// Returns false if nothing here authorises the access, in which case the
+/// caller destroys the process.
+pub fn fault_in(addr: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    let page = addr & !(PAGE_SIZE - 1);
+    let (pml4, paddr, prot) = {
+        let g = GRAPH.lock();
+        let t: Ref<Thread> = match g.typed(crate::sched::current_locked(&g)) {
+            Some(t) => t,
+            None => return false,
+        };
+        let space = match g.space_of(t) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        let start = crate::time::rdtsc();
+        let found = g.find_mapping(space, page);
+        LOOKUP_CYCLES.fetch_add(crate::time::rdtsc() - start, Ordering::Relaxed);
+
+        let (eid, attr) = match found {
+            Some(x) => x,
+            None => return false, // nothing is mapped here at all
+        };
+        if !attr.flags.contains(MapFlags::LAZY) {
+            // An eager mapping is already in the tables, so a fault on one is a
+            // protection violation and the process's own doing.
+            return false;
+        }
+        let obj_id = match g.edge(eid) {
+            Some(e) => e.dst,
+            None => return false,
+        };
+        let obj: Ref<MemoryObject> = match g.typed(obj_id) {
+            Some(o) => o,
+            None => return false,
+        };
+        let base = match g.body(obj) {
+            Some(b) => b.phys_base,
+            None => return false,
+        };
+        let index = (page - attr.vaddr) / PAGE_SIZE + attr.off_pages as u64;
+        let pml4 = match g.body(space) {
+            Some(b) => b.pml4_phys,
+            None => return false,
+        };
+        (pml4, base + index * PAGE_SIZE, attr.prot)
+    };
+
+    let mut fa = FRAMES.lock();
+    let fa = match fa.as_mut() {
+        Some(f) => f,
+        None => return false,
+    };
+    // SAFETY: a page-table root this kernel built, and one page inside a range
+    // the graph says this address space may use.
+    match unsafe { paging::map_pages(pml4, page, paddr, 1, prot, fa) } {
+        Ok(()) => {
+            LAZY_FAULTS.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        // Already present means the fault was about permissions, not absence.
+        Err(_) => false,
+    }
 }
 
 // ------------------------------------------------------------- invariant ---
@@ -212,6 +298,12 @@ pub fn check_page_tables(g: &Graph) -> Result<(), I5> {
                 let want = base + (attr.off_pages as u64 + i) * PAGE_SIZE;
                 // SAFETY: reading page tables of a space this kernel owns.
                 match unsafe { paging::translate(pml4, vaddr) } {
+                    // A lazy mapping is allowed to have no entry yet: the edge
+                    // is the mapping and the tables are a cache of it, so a cold
+                    // cache is not a divergence. What is *not* allowed is an
+                    // entry nobody authorised, and the second direction below
+                    // still checks that with no exception at all.
+                    None if attr.flags.contains(MapFlags::LAZY) => continue,
                     None => return Err(I5::MissingEntry { space: node, edge: eid, vaddr }),
                     Some((got, entry)) => {
                         if got != want {

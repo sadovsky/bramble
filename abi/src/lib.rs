@@ -45,6 +45,17 @@ pub const SYS_KILL: u64 = 11;
 pub const SYS_ENDPOINT: u64 = 12;
 /// check() -> 0 if every kernel invariant holds, or a negative code
 pub const SYS_CHECK: u64 = 13;
+/// mem_create(pages) -> a slot holding zeroed memory the caller owns
+pub const SYS_MEM_CREATE: u64 = 14;
+/// map(memory_slot, vaddr, prot, lazy) -> 0
+pub const SYS_MAP: u64 = 15;
+/// unmap(vaddr) -> 0
+pub const SYS_UNMAP: u64 = 16;
+
+/// Page protection bits for `map`. These match the kernel's `Prot`.
+pub const P_READ: u64 = 1 << 0;
+pub const P_WRITE: u64 = 1 << 1;
+pub const P_EXEC: u64 = 1 << 2;
 
 /// Words in one IPC message. Sized to be copied without ceremony; anything
 /// larger is what shared memory and a capability to it are for.

@@ -39,6 +39,9 @@ pub enum GraphError {
     RangeOverlap,
     /// The thread is not in a state that permits this transition (I6).
     BadState,
+    /// The address space already holds as many mappings as its range index has
+    /// room for.
+    TooManyMappings,
 }
 
 pub type Result<T> = core::result::Result<T, GraphError>;
@@ -508,10 +511,11 @@ impl Graph {
                 if let Some(b) = self.body_mut(m) {
                     b.map_count = b.map_count.saturating_sub(1);
                 }
+                // `range_remove` decrements `mapping_count` itself: the count
+                // and the index are one thing, and letting them be adjusted
+                // separately is how they would drift.
                 let s: Ref<AddressSpace> = Ref::from_raw(e.src);
-                if let Some(b) = self.body_mut(s) {
-                    b.mapping_count = b.mapping_count.saturating_sub(1);
-                }
+                self.range_remove(s, ei, MapsAttr::decode(e.data).vaddr);
             }
             EdgeKind::Waiting => {
                 // The object this thread was waiting on is going away, or the
@@ -554,6 +558,14 @@ impl Graph {
         self.edges.free(ei);
         self.seq += 1;
         Ok(())
+    }
+
+    /// The generation currently held by an edge slot, for callers that have an
+    /// index and need to build an id. Only the checker and the range index have
+    /// bare indices to begin with.
+    #[inline]
+    pub fn edge_generation(&self, idx: u32) -> u32 {
+        self.edges.at(idx).generation
     }
 
     #[inline]
@@ -625,22 +637,143 @@ impl Graph {
         attr: MapsAttr,
     ) -> Result<EdgeId> {
         self.precheck_link(s.id, EdgeKind::Maps, m.id)?;
-        // Invariant I7: ranges within one address space must not overlap.
-        for e in self.out_edges(s.id, EdgeKind::Maps) {
-            if let Some(edge) = self.edge(e) {
-                if MapsAttr::decode(edge.data).overlaps(&attr) {
-                    return Err(GraphError::RangeOverlap);
-                }
-            }
+        let count = self.body(s).ok_or(GraphError::StaleNode(s.id))?.mapping_count as usize;
+        if count >= MAX_MAPPINGS_PER_SPACE {
+            return Err(GraphError::TooManyMappings);
         }
-        let e = self.link_raw(s.id, EdgeKind::Maps, m.id, attr.encode())?;
+
+        // Invariant I7: ranges within one address space must not overlap. With
+        // the index this is two comparisons rather than a scan, because a
+        // sorted list of disjoint ranges can only be disturbed by its immediate
+        // neighbours.
+        let pos = self.range_lower_bound(s, attr.vaddr);
+        if pos > 0 && self.range_attr(s, pos - 1).is_some_and(|a| a.overlaps(&attr)) {
+            return Err(GraphError::RangeOverlap);
+        }
+        if pos < count && self.range_attr(s, pos).is_some_and(|a| a.overlaps(&attr)) {
+            return Err(GraphError::RangeOverlap);
+        }
+
+        let e = self.link_prechecked(s.id, EdgeKind::Maps, m.id, attr.encode())?;
         if let Some(b) = self.body_mut(m) {
             b.map_count += 1;
         }
         if let Some(b) = self.body_mut(s) {
+            b.ranges.copy_within(pos..count, pos + 1);
+            b.ranges[pos] = e.idx();
             b.mapping_count += 1;
         }
         Ok(e)
+    }
+
+    // ------------------------------------------------------- range index ---
+    //
+    // "Which mapping covers this address?" is the one question the graph cannot
+    // answer on its own: adjacency lists relate objects, not intervals. DESIGN
+    // 5.3 names this as a compromise rather than pretending otherwise, and this
+    // is the side structure it calls for. It is derived from the `Maps` edges,
+    // maintained by the two operations that create and destroy them, and
+    // checked against them (invariant I11).
+
+    /// The attributes of the `i`th mapping of a space, in address order.
+    fn range_attr(&self, s: Ref<AddressSpace>, i: usize) -> Option<MapsAttr> {
+        let ei = self.body(s)?.ranges.get(i).copied()?;
+        if ei == 0 {
+            return None;
+        }
+        let e = self.edges.at(ei);
+        if !e.is_live() || e.kind != EdgeKind::Maps as u8 {
+            return None;
+        }
+        Some(MapsAttr::decode(e.data))
+    }
+
+    /// The first index whose mapping starts at or after `vaddr`.
+    fn range_lower_bound(&self, s: Ref<AddressSpace>, vaddr: u64) -> usize {
+        let n = self.body(s).map_or(0, |b| b.mapping_count as usize);
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.range_attr(s, mid) {
+                Some(a) if a.vaddr < vaddr => lo = mid + 1,
+                _ => hi = mid,
+            }
+        }
+        lo
+    }
+
+    /// Which mapping covers `vaddr`, if any. O(log n), and the page-fault
+    /// handler's whole job.
+    pub fn find_mapping(
+        &self,
+        s: Ref<AddressSpace>,
+        vaddr: u64,
+    ) -> Option<(EdgeId, MapsAttr)> {
+        let pos = self.range_lower_bound(s, vaddr.saturating_add(1));
+        if pos == 0 {
+            return None;
+        }
+        let i = pos - 1;
+        let attr = self.range_attr(s, i)?;
+        if !attr.covers(vaddr) {
+            return None;
+        }
+        let ei = self.body(s)?.ranges[i];
+        let e = self.edges.at(ei);
+        Some((EdgeId::new(ei, e.generation), attr))
+    }
+
+    /// The same answer as `find_mapping`, found by walking every mapping.
+    ///
+    /// This is what the graph can do unaided, and it is the control the range
+    /// index has to beat. Kept in the tree rather than deleted, because a
+    /// shortcut whose correctness nothing checks is a liability, and because
+    /// the comparison is the argument for having the index at all.
+    pub fn find_mapping_scanning(
+        &self,
+        s: Ref<AddressSpace>,
+        vaddr: u64,
+    ) -> Option<(EdgeId, MapsAttr)> {
+        for eid in self.out_edges(s.id, EdgeKind::Maps) {
+            let e = self.edge(eid)?;
+            let attr = MapsAttr::decode(e.data);
+            if attr.covers(vaddr) {
+                return Some((eid, attr));
+            }
+        }
+        None
+    }
+
+    /// Number of mappings, for callers that want to know how deep the search is.
+    pub fn mapping_count(&self, s: Ref<AddressSpace>) -> u32 {
+        self.body(s).map_or(0, |b| b.mapping_count)
+    }
+
+    /// Drop one entry from a space's range index.
+    fn range_remove(&mut self, s: Ref<AddressSpace>, edge_idx: u32, vaddr: u64) {
+        let count = self.body(s).map_or(0, |b| b.mapping_count as usize);
+        // Find it by address, then confirm by identity: two mappings never
+        // share a start, but confirming costs nothing and a silent mismatch
+        // here would corrupt the index rather than fail.
+        let start = self.range_lower_bound(s, vaddr);
+        let mut found = None;
+        for i in start..count {
+            if self.body(s).map(|b| b.ranges[i]) == Some(edge_idx) {
+                found = Some(i);
+                break;
+            }
+        }
+        let i = match found.or_else(|| {
+            (0..count).find(|&i| self.body(s).map(|b| b.ranges[i]) == Some(edge_idx))
+        }) {
+            Some(i) => i,
+            None => return,
+        };
+        if let Some(b) = self.body_mut(s) {
+            b.ranges.copy_within(i + 1..count, i);
+            b.ranges[count - 1] = 0;
+            b.mapping_count = b.mapping_count.saturating_sub(1);
+        }
     }
 
     pub fn link_named<B: NodeBody>(

@@ -5,7 +5,7 @@
 //! at boot and panic on failure, so `scripts/smoke.sh` turns them into a
 //! build-breaking test.
 
-use bramble_graph::edge::{MapsAttr, Prot};
+use bramble_graph::edge::{MapFlags, MapsAttr, Prot};
 
 use crate::paging::{self, PTE_PRESENT, PTE_USER, PTE_WRITABLE};
 use crate::state::{self, FRAMES, GRAPH};
@@ -42,7 +42,7 @@ pub fn address_spaces() {
     let obj = vm::alloc_object(root, TEST_PAGES).expect("memory object");
     let phys = GRAPH.lock().body(obj).expect("body").phys_base;
 
-    let attr = MapsAttr { vaddr: TEST_VADDR, len_pages: TEST_PAGES, off_pages: 0, prot: Prot::RWU };
+    let attr = MapsAttr { vaddr: TEST_VADDR, len_pages: TEST_PAGES, off_pages: 0, prot: Prot::RWU, flags: MapFlags::NONE };
     let edge = vm::map(space, obj, attr).expect("map");
     state::assert_consistent("after map");
     println!("vm:   mapped {} pages at {:#x} -> {:#x}, checker clean", TEST_PAGES, TEST_VADDR, phys);
@@ -867,4 +867,134 @@ pub fn v1(modules: &[&limine::file::File]) {
     let after = census();
     assert_eq!(before, after, "v1 left something behind");
     cprintln!(fb::ACCENT, "v1:   the whole kernel left the machine as bytes, twice");
+}
+
+// ---------------------------------------------------------------- phase 9 ---
+
+
+/// How much does a range query cost, and does the index earn its place?
+///
+/// DESIGN 5.3 lists "range queries are foreign" as a compromise: adjacency
+/// lists relate objects, not intervals, so "which mapping covers this address?"
+/// needs a side structure. This measures the side structure against what the
+/// graph can do unaided.
+fn range_query_benchmark(root: Ref<bramble_graph::body::Root>) {
+    const LOOKUPS: u64 = 20_000;
+    println!("bench: which mapping covers this address, {} lookups each", LOOKUPS);
+    println!("       mappings   indexed   scanning");
+
+    for &n in &[1usize, 4, 16, 32] {
+        let (proc, space) = {
+            let mut g = GRAPH.lock();
+            let p = g.create_under_root(root, bramble_graph::body::Process::ZERO).expect("proc");
+            let s = g
+                .create_under_process(p, bramble_graph::body::AddressSpace::ZERO)
+                .expect("space");
+            (p, s)
+        };
+        let obj = crate::vm::alloc_object_for(proc, 1).expect("object");
+        {
+            let mut g = GRAPH.lock();
+            for i in 0..n {
+                g.link_maps(
+                    space,
+                    obj,
+                    MapsAttr {
+                        vaddr: 0x1000_0000 + i as u64 * 0x2000,
+                        len_pages: 1,
+                        off_pages: 0,
+                        prot: Prot::RWU,
+                        flags: MapFlags::LAZY,
+                    },
+                )
+                .expect("map");
+            }
+        }
+        state::assert_consistent("after filling the range index");
+
+        // Look for the last mapping, which is the worst case for a scan and
+        // no worse than any other for a binary search.
+        let target = 0x1000_0000 + (n as u64 - 1) * 0x2000;
+        let (indexed, scanning) = {
+            let g = GRAPH.lock();
+            let start = crate::time::rdtsc();
+            for _ in 0..LOOKUPS {
+                core::hint::black_box(g.find_mapping(space, target));
+            }
+            let mid = crate::time::rdtsc();
+            for _ in 0..LOOKUPS {
+                core::hint::black_box(g.find_mapping_scanning(space, target));
+            }
+            let end = crate::time::rdtsc();
+            ((mid - start) / LOOKUPS, (end - mid) / LOOKUPS)
+        };
+        println!("       {:>8}   {:>7}   {:>8}", n, indexed, scanning);
+
+        {
+            let mut g = GRAPH.lock();
+            g.begin_delete(proc.id()).expect("delete");
+        }
+        reaper::drain();
+        state::assert_consistent("after emptying the range index");
+    }
+}
+
+/// Phase 9: lazy mapping, and the side structure a range query needs.
+pub fn lazy_mapping(modules: &[&limine::file::File]) {
+    let (root, console) = {
+        let g = GRAPH.lock();
+        let boot = crate::state::BOOT.lock();
+        (g.root().expect("root"), boot.console)
+    };
+    let before = census();
+    let boot = crate::sched::adopt_boot_thread(root).expect("boot thread");
+
+    range_query_benchmark(root);
+
+    let elf = find_module(modules, "lazy").expect("the lazy module is missing");
+    let faults_before = crate::vm::LAZY_FAULTS.load(AtomicOrdering::Relaxed);
+    x86_64::instructions::interrupts::enable();
+
+    let proc = crate::proc::spawn(
+        crate::proc::Owner::Root(root),
+        elf,
+        &[(console, Rights::READ.union(Rights::WRITE))],
+    )
+    .unwrap_or_else(|e| panic!("could not spawn lazy: {}", e.describe()));
+    crate::proc::start(proc).expect("start lazy");
+
+    let deadline = crate::time::ticks() + 6000;
+    let mut rounds = 0u32;
+    while GRAPH.lock().is_live(proc.id()) {
+        crate::sched::yield_now();
+        rounds += 1;
+        if rounds.is_multiple_of(32) {
+            reaper::drain();
+            state::assert_consistent("while the lazy program ran");
+            assert!(crate::time::ticks() < deadline, "the lazy program never finished");
+        }
+    }
+    x86_64::instructions::interrupts::disable();
+    reaper::drain();
+
+    let served = crate::vm::LAZY_FAULTS.load(AtomicOrdering::Relaxed) - faults_before;
+    println!("vm:   {} page faults served by filling in a lazy mapping", served);
+    // It mapped 512 pages and touched three. If laziness meant anything, three
+    // is what the hardware learned about.
+    assert!(served >= 3, "expected at least three faults, saw {}", served);
+    assert!(served < 32, "expected a handful of faults, saw {}: the mapping was not lazy", served);
+
+    {
+        let mut g = GRAPH.lock();
+        g.begin_delete(boot.id()).expect("delete boot thread");
+        if let Some(cpu) = g.typed::<Cpu>(crate::state::cpu0()) {
+            if let Some(b) = g.body_mut(cpu) {
+                b.current = NodeId::NULL;
+            }
+        }
+    }
+    reaper::drain();
+    let after = census();
+    assert_eq!(before, after, "the lazy program left something behind");
+    cprintln!(fb::ACCENT, "vm:   512 pages mapped, 3 pages realised, nothing leaked");
 }

@@ -63,6 +63,11 @@ pub enum Violation {
     MappingCountStale { space: NodeId, cached: u32, actual: u32 },
     /// I7: two mappings in one address space cover the same virtual page.
     MappingOverlap { space: NodeId, a: EdgeId, b: EdgeId },
+    /// I11: the range index disagrees with the `Maps` edges it indexes.
+    RangeIndexUnsorted { space: NodeId, at: usize },
+    RangeIndexStale { space: NodeId, at: usize },
+    RangeIndexCount { space: NodeId, indexed: u32, edges: u32 },
+    RangeIndexMissing { space: NodeId, edge: EdgeId },
     /// The walk exceeded its budget, which means a list is corrupt.
     WalkOverrun { node: NodeId },
     /// A single-valued relationship has more than one edge. This is the
@@ -113,6 +118,7 @@ impl Checker {
         self.check_scheduler(g)?;
         self.check_handles(g)?;
         self.check_cardinality(g)?;
+        self.check_range_index(g)?;
         self.check_caches(g)?;
         Ok(())
     }
@@ -342,6 +348,62 @@ impl Checker {
                 if count > 1 {
                     let d = if dir == Dir::Out { "out" } else { "in" };
                     return Err(Violation::Cardinality { node, kind, dir: d, count });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// I11: the range index is exactly the `Maps` edges, in address order.
+    ///
+    /// This is the newest derived index and so the most likely to drift. It is
+    /// also the one whose drift would be least visible: a stale entry does not
+    /// break anything until a page fault lands on it, at which point a process
+    /// is handed the wrong memory.
+    fn check_range_index(&self, g: &Graph) -> CheckResult {
+        for node in g.live_nodes() {
+            if node.kind() != Some(NodeKind::AddressSpace) {
+                continue;
+            }
+            let space: Ref<AddressSpace> = g.typed(node).expect("address space");
+            let body = g.body(space).expect("body");
+            let count = body.mapping_count as usize;
+            if count > MAX_MAPPINGS_PER_SPACE {
+                return Err(Violation::RangeIndexCount {
+                    space: node,
+                    indexed: body.mapping_count,
+                    edges: 0,
+                });
+            }
+
+            let edges = g.out_edges(node, EdgeKind::Maps).count();
+            if edges != count {
+                return Err(Violation::RangeIndexCount {
+                    space: node,
+                    indexed: body.mapping_count,
+                    edges: edges as u32,
+                });
+            }
+
+            let mut previous_end = 0u64;
+            for (i, &ei) in body.ranges[..count].iter().enumerate() {
+                let edge = match g.edge(EdgeId::new(ei, g.edge_generation(ei))) {
+                    Some(e) if e.kind == EdgeKind::Maps as u8 && e.src == node => e,
+                    _ => return Err(Violation::RangeIndexStale { space: node, at: i }),
+                };
+                let attr = MapsAttr::decode(edge.data);
+                // Sorted, and by I7 also disjoint, so each range must start at
+                // or after the previous one ended.
+                if attr.vaddr < previous_end {
+                    return Err(Violation::RangeIndexUnsorted { space: node, at: i });
+                }
+                previous_end = attr.end();
+            }
+
+            // And nothing indexed that is not an edge, or the reverse.
+            for eid in g.out_edges(node, EdgeKind::Maps) {
+                if !body.ranges[..count].contains(&eid.idx()) {
+                    return Err(Violation::RangeIndexMissing { space: node, edge: eid });
                 }
             }
         }

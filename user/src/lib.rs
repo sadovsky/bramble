@@ -121,6 +121,28 @@ pub fn endpoint_create() -> i64 {
     unsafe { syscall(abi::SYS_ENDPOINT, 0, 0, 0, 0) }
 }
 
+/// Allocate zeroed memory owned by this process.
+pub fn mem_create(pages: u64) -> i64 {
+    // SAFETY: no pointer arguments.
+    unsafe { syscall(abi::SYS_MEM_CREATE, pages, 0, 0, 0) }
+}
+
+/// Map memory into this process's own address space.
+///
+/// `lazy` leaves the page tables empty: the mapping exists in the kernel's
+/// graph, and each page is realised the first time it is touched.
+pub fn map(mem_slot: u32, vaddr: u64, prot: u64, lazy: bool) -> i64 {
+    // SAFETY: no pointer arguments; the kernel validates the address.
+    unsafe {
+        syscall(abi::SYS_MAP, mem_slot as u64, vaddr, prot, u64::from(lazy))
+    }
+}
+
+pub fn unmap(vaddr: u64) -> i64 {
+    // SAFETY: no pointer arguments.
+    unsafe { syscall(abi::SYS_UNMAP, vaddr, 0, 0, 0) }
+}
+
 /// Ask the kernel to verify its own invariants. Zero means everything holds.
 pub fn check() -> i64 {
     // SAFETY: no pointer arguments.

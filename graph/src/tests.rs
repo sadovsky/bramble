@@ -220,7 +220,7 @@ fn deleting_an_owner_destroys_its_subtree() {
     let child = g.create_under_process(parent, Process::ZERO).unwrap();
     let gchild = g.create_under_process(child, Thread::ZERO).unwrap();
     let mem = g.create_under_process(child, MemoryObject { phys_base: 0x1000, pages: 4, ..MemoryObject::ZERO }).unwrap();
-    g.link_maps(space, mem, MapsAttr { vaddr: 0x400000, len_pages: 4, off_pages: 0, prot: Prot::READ }).unwrap();
+    g.link_maps(space, mem, MapsAttr { vaddr: 0x400000, len_pages: 4, off_pages: 0, prot: Prot::READ, flags: MapFlags::NONE }).unwrap();
     g.grant(parent, mem, Rights::READ).unwrap();
     check(&g);
 
@@ -318,11 +318,11 @@ fn overlapping_mappings_are_rejected() {
     let s = g.create_under_process(p, AddressSpace::ZERO).unwrap();
     let m = g.create_under_process(p, MemoryObject { pages: 8, ..MemoryObject::ZERO }).unwrap();
 
-    let a = MapsAttr { vaddr: 0x1000_0000, len_pages: 4, off_pages: 0, prot: Prot::READ };
+    let a = MapsAttr { vaddr: 0x1000_0000, len_pages: 4, off_pages: 0, prot: Prot::READ, flags: MapFlags::NONE };
     g.link_maps(s, m, a).unwrap();
-    let overlapping = MapsAttr { vaddr: 0x1000_2000, len_pages: 4, off_pages: 0, prot: Prot::READ };
+    let overlapping = MapsAttr { vaddr: 0x1000_2000, len_pages: 4, off_pages: 0, prot: Prot::READ, flags: MapFlags::NONE };
     assert!(matches!(g.link_maps(s, m, overlapping), Err(GraphError::RangeOverlap)));
-    let adjacent = MapsAttr { vaddr: 0x1000_4000, len_pages: 4, off_pages: 4, prot: Prot::READ };
+    let adjacent = MapsAttr { vaddr: 0x1000_4000, len_pages: 4, off_pages: 4, prot: Prot::READ, flags: MapFlags::NONE };
     g.link_maps(s, m, adjacent).unwrap();
     assert_eq!(g.body(m).unwrap().map_count, 2);
     check(&g);
@@ -431,7 +431,7 @@ fn random_ops(seed: u64, steps: usize, check_every: usize) {
     let mut mems: Vec<Ref<MemoryObject>> = Vec::new();
     let mut eps: Vec<Ref<Endpoint>> = Vec::new();
     let mut caps: Vec<(Ref<Process>, u32)> = Vec::new();
-    let mut next_vaddr: u64 = 0x1000_0000;
+    let mut next_vaddr: u64;
     let mut history: Vec<(usize, usize, NodeId)> = Vec::new();
     let note = |h: &mut Vec<(usize, usize, NodeId)>, step, op, id: NodeId| {
         h.push((step, op, id));
@@ -493,11 +493,13 @@ fn random_ops(seed: u64, steps: usize, check_every: usize) {
             }
             6 => {
                 if let (Some(s), Some(m)) = (rng.pick(&spaces), rng.pick(&mems)) {
-                    next_vaddr += 0x10_0000;
+                    // Scattered rather than rising, so the index has to sort,
+                    // and often colliding, so the overlap check is exercised.
+                    next_vaddr = 0x1000_0000 + (rng.next() % 64) * 0x10_0000;
                     let _ = g.link_maps(
                         s,
                         m,
-                        MapsAttr { vaddr: next_vaddr, len_pages: 4, off_pages: 0, prot: Prot::READ },
+                        MapsAttr { vaddr: next_vaddr, len_pages: 4, off_pages: 0, prot: Prot::READ, flags: MapFlags::NONE },
                     );
                 }
             }
@@ -524,6 +526,15 @@ fn random_ops(seed: u64, steps: usize, check_every: usize) {
                 if let (Some(t), Some(e)) = (rng.pick(&threads), rng.pick(&eps)) {
                     note(&mut history, step, op, t.id());
                     let _ = g.make_blocked(t, e, WaitingAttr { role: WaitRole::Recv, badge: 1 });
+                }
+            }
+            11 if rng.next().is_multiple_of(4) => {
+                // Unmap something, so the index is exercised in both directions.
+                if let Some(s) = rng.pick(&spaces) {
+                    let victim = g.walk_out(s.id(), EdgeKind::Maps).into_iter().next();
+                    if let Some(e) = victim {
+                        let _ = g.unlink(e);
+                    }
                 }
             }
             11 => {
@@ -865,4 +876,126 @@ fn pick_and_rotate_matches_doing_it_the_long_way() {
         check(&a);
         check(&b);
     }
+}
+
+// ------------------------------------------------------------ range index ---
+
+#[test]
+fn the_range_index_answers_what_a_scan_would() {
+    let mut g = empty();
+    let root = g.create_root().unwrap();
+    let p = g.create_under_root(root, Process::ZERO).unwrap();
+    let s = g.create_under_process(p, AddressSpace::ZERO).unwrap();
+    let m = g.create_under_process(p, MemoryObject { pages: 64, ..MemoryObject::ZERO }).unwrap();
+
+    // Deliberately inserted out of order: the index has to sort them.
+    let starts = [0x8000u64, 0x1000, 0x5000, 0x3000, 0xB000];
+    for (i, base) in starts.iter().enumerate() {
+        g.link_maps(
+            s,
+            m,
+            MapsAttr {
+                vaddr: *base,
+                len_pages: 1,
+                off_pages: i as u32,
+                prot: Prot::READ,
+                flags: MapFlags::NONE,
+            },
+        )
+        .unwrap();
+        check(&g);
+    }
+
+    // Every address in a wide sweep must give the same answer as looking at
+    // every mapping in turn. The index is a shortcut, not a different answer.
+    for page in 0..16u64 {
+        let addr = page * 0x1000 + 0x800;
+        let by_scan = g
+            .walk_out(s.id(), EdgeKind::Maps)
+            .into_iter()
+            .find(|e| MapsAttr::decode(g.edge(*e).unwrap().data).covers(addr));
+        let by_index = g.find_mapping(s, addr).map(|(e, _)| e);
+        assert_eq!(by_index, by_scan, "disagreement at {:#x}", addr);
+    }
+
+    // Removing from the middle keeps it sorted and keeps answering.
+    let middle = g.find_mapping(s, 0x5000).unwrap().0;
+    g.unlink(middle).unwrap();
+    check(&g);
+    assert!(g.find_mapping(s, 0x5000).is_none());
+    assert!(g.find_mapping(s, 0x3000).is_some());
+    assert!(g.find_mapping(s, 0x8000).is_some());
+    assert_eq!(g.mapping_count(s), 4);
+}
+
+#[test]
+fn overlapping_mappings_are_still_rejected_by_the_index() {
+    let mut g = empty();
+    let root = g.create_root().unwrap();
+    let p = g.create_under_root(root, Process::ZERO).unwrap();
+    let s = g.create_under_process(p, AddressSpace::ZERO).unwrap();
+    let m = g.create_under_process(p, MemoryObject { pages: 64, ..MemoryObject::ZERO }).unwrap();
+
+    let put = |g: &mut Graph, at: u64, pages: u32| {
+        g.link_maps(
+            s,
+            m,
+            MapsAttr {
+                vaddr: at,
+                len_pages: pages,
+                off_pages: 0,
+                prot: Prot::READ,
+                flags: MapFlags::NONE,
+            },
+        )
+    };
+    put(&mut g, 0x4000, 4).unwrap();
+    put(&mut g, 0x1000, 1).unwrap();
+    put(&mut g, 0x9000, 1).unwrap();
+    // Straddling the low edge, the high edge, and entirely inside.
+    assert!(matches!(put(&mut g, 0x3000, 2), Err(GraphError::RangeOverlap)));
+    assert!(matches!(put(&mut g, 0x7000, 3), Err(GraphError::RangeOverlap)));
+    assert!(matches!(put(&mut g, 0x5000, 1), Err(GraphError::RangeOverlap)));
+    // And the gaps around them are still free.
+    put(&mut g, 0x2000, 2).unwrap();
+    put(&mut g, 0x8000, 1).unwrap();
+    check(&g);
+    assert_eq!(g.mapping_count(s), 5);
+}
+
+#[test]
+fn a_full_range_index_reports_it_rather_than_overflowing() {
+    let mut g = empty();
+    let root = g.create_root().unwrap();
+    let p = g.create_under_root(root, Process::ZERO).unwrap();
+    let s = g.create_under_process(p, AddressSpace::ZERO).unwrap();
+    let m = g.create_under_process(p, MemoryObject { pages: 64, ..MemoryObject::ZERO }).unwrap();
+
+    for i in 0..MAX_MAPPINGS_PER_SPACE {
+        g.link_maps(
+            s,
+            m,
+            MapsAttr {
+                vaddr: 0x1000 + i as u64 * 0x2000,
+                len_pages: 1,
+                off_pages: 0,
+                prot: Prot::READ,
+                flags: MapFlags::NONE,
+            },
+        )
+        .unwrap();
+    }
+    let overflow = g.link_maps(
+        s,
+        m,
+        MapsAttr {
+            vaddr: 0x9000_0000,
+            len_pages: 1,
+            off_pages: 0,
+            prot: Prot::READ,
+            flags: MapFlags::NONE,
+        },
+    );
+    assert!(matches!(overflow, Err(GraphError::TooManyMappings)));
+    check(&g);
 }

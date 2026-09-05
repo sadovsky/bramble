@@ -117,6 +117,23 @@ impl Prot {
     pub const RXU: Prot = Prot(Prot::READ.0 | Prot::EXEC.0 | Prot::USER.0);
 }
 
+/// How a mapping is realised in the page tables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[repr(transparent)]
+pub struct MapFlags(pub u8);
+
+impl MapFlags {
+    pub const NONE: MapFlags = MapFlags(0);
+    /// The edge exists but the page-table entries do not. They are written one
+    /// page at a time, when the page is first touched. A mapping is still a
+    /// mapping: the graph says the memory is there, and the hardware is brought
+    /// up to date lazily rather than eagerly.
+    pub const LAZY: MapFlags = MapFlags(1 << 0);
+    pub const fn contains(self, o: MapFlags) -> bool {
+        self.0 & o.0 == o.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MapsAttr {
     pub vaddr: u64,
@@ -124,9 +141,15 @@ pub struct MapsAttr {
     /// Offset into the memory object, in pages.
     pub off_pages: u32,
     pub prot: Prot,
+    pub flags: MapFlags,
 }
 
 impl MapsAttr {
+    /// Does this mapping cover `vaddr`?
+    pub const fn covers(&self, vaddr: u64) -> bool {
+        vaddr >= self.vaddr && vaddr < self.end()
+    }
+
     /// Exclusive end of the virtual range, in bytes.
     pub const fn end(&self) -> u64 {
         self.vaddr + (self.len_pages as u64) * 4096
@@ -144,6 +167,7 @@ impl EdgeAttr for MapsAttr {
         r.put_u32(8, self.len_pages);
         r.put_u32(12, self.off_pages);
         r.0[16] = self.prot.0;
+        r.0[17] = self.flags.0;
         r
     }
     fn decode(raw: RawEdgeData) -> Self {
@@ -152,6 +176,7 @@ impl EdgeAttr for MapsAttr {
             len_pages: raw.get_u32(8),
             off_pages: raw.get_u32(12),
             prot: Prot(raw.0[16]),
+            flags: MapFlags(raw.0[17]),
         }
     }
 }

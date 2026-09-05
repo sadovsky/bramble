@@ -300,8 +300,14 @@ extern "C" fn kmain() -> ! {
     println!();
     dump::dump_graph();
 
+    // ---- phase 9: lazy mapping and the range index ----
     println!();
-    cprintln!(fb::ACCENT, "phase 8 complete. v1 reached. halting.");
+    selftest::lazy_mapping(modules);
+    println!();
+    dump::dump_graph();
+
+    println!();
+    cprintln!(fb::ACCENT, "phase 9 complete. halting.");
     halt_forever();
 }
 

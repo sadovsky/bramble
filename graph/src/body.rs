@@ -5,7 +5,7 @@
 //! meaning.
 
 use crate::id::NodeKind;
-use crate::limits::HANDLE_SLOTS;
+use crate::limits::{HANDLE_SLOTS, MAX_MAPPINGS_PER_SPACE};
 
 /// Implemented by every node body. `ZERO` is what makes `.bss` a valid graph.
 pub trait NodeBody: Copy {
@@ -219,22 +219,57 @@ impl NodeBody for Thread {
     };
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct AddressSpace {
     /// Physical address of the page-table root. The tables themselves are a
     /// cache of `Maps` edges (invariant I5).
     pub pml4_phys: u64,
+    /// Also the number of live entries in `ranges`.
     pub mapping_count: u32,
     pub is_kernel: u8,
     pub _pad: [u8; 3],
+    /// Edge slab indices of this space's `Maps` edges, **sorted by virtual
+    /// address**.
+    ///
+    /// The design admits (DESIGN 5.3, compromise 7) that a graph gives nothing
+    /// for free when the question is keyed by an address: "which mapping covers
+    /// this fault?" is a range query, and adjacency lists cannot answer one. So
+    /// this is the side structure, and like every other derived index here it
+    /// is maintained by the edge operations and audited by the checker
+    /// (invariant I11).
+    pub ranges: [u32; MAX_MAPPINGS_PER_SPACE],
 }
 
 impl NodeBody for AddressSpace {
     const KIND: NodeKind = NodeKind::AddressSpace;
-    const ZERO: Self =
-        AddressSpace { pml4_phys: 0, mapping_count: 0, is_kernel: 0, _pad: [0; 3] };
+    const ZERO: Self = AddressSpace {
+        pml4_phys: 0,
+        mapping_count: 0,
+        is_kernel: 0,
+        _pad: [0; 3],
+        ranges: [0; MAX_MAPPINGS_PER_SPACE],
+    };
 }
+
+impl core::fmt::Debug for AddressSpace {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AddressSpace")
+            .field("pml4_phys", &self.pml4_phys)
+            .field("mappings", &self.mapping_count)
+            .field("is_kernel", &self.is_kernel)
+            .finish()
+    }
+}
+
+impl PartialEq for AddressSpace {
+    fn eq(&self, o: &Self) -> bool {
+        self.pml4_phys == o.pml4_phys
+            && self.mapping_count == o.mapping_count
+            && self.is_kernel == o.is_kernel
+    }
+}
+impl Eq for AddressSpace {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]

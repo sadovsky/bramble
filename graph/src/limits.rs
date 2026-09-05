@@ -23,3 +23,10 @@ pub const HANDLE_SLOTS: usize = 256;
 
 /// Longest name storable inline in a `Named` edge.
 pub const MAX_NAME_LEN: usize = 23;
+
+/// Mappings one address space may hold.
+///
+/// This is a hard cap, and it exists because the range index lives inside the
+/// `AddressSpace` body rather than in allocated memory. Post-v1 growth would
+/// make it a chunked side table like the arenas themselves.
+pub const MAX_MAPPINGS_PER_SPACE: usize = 32;

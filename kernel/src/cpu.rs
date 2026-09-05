@@ -170,6 +170,18 @@ extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
 /// cleanup path to write, and that is the ownership tree earning its keep.
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
     let from_user = code.contains(PageFaultErrorCode::USER_MODE);
+    let addr = x86_64::registers::control::Cr2::read_raw();
+
+    // A fault inside a lazy mapping is not an error, it is the mapping being
+    // realised. Only if the graph does not authorise this address does the
+    // process die.
+    if from_user
+        && !code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+        && crate::vm::fault_in(addr)
+    {
+        return;
+    }
+
     if from_user {
         // SAFETY: the faulting process is about to be destroyed.
         unsafe {
@@ -180,7 +192,7 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         crate::cprintln!(
             crate::fb::ALERT,
             "*** killing a process: page fault at {:#x} from ring 3 ***",
-            x86_64::registers::control::Cr2::read_raw()
+            addr
         );
         crate::println!("  rip {:#018x}  cause {:?}", frame.instruction_pointer.as_u64(), code);
         crate::sched::exit_current_process(-11);
