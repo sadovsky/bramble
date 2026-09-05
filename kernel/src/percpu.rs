@@ -25,7 +25,11 @@
 #[unsafe(no_mangle)]
 pub static mut BRAMBLE_KERNEL_RSP: u64 = 0;
 
-/// Scratch: where the syscall stub parks the user's stack pointer.
+/// One scratch word, live for the two instructions between entering the kernel
+/// and having a stack to push onto. It must not hold anything for longer than
+/// that: interrupts are masked across those two instructions, but a system call
+/// that *blocks* runs other threads, and anything left in a global here would
+/// be read back by whichever thread returns to ring 3 first.
 #[unsafe(no_mangle)]
 pub static mut BRAMBLE_USER_RSP: u64 = 0;
 

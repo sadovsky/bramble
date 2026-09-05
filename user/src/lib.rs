@@ -74,6 +74,29 @@ pub fn inspect(buf: &mut [u8]) -> i64 {
     unsafe { syscall(abi::SYS_INSPECT, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) }
 }
 
+/// Send a message. `cap_slot` of zero sends no capability; otherwise the
+/// capability in that slot is copied to the receiver, masked by what we hold.
+/// Passing one requires `Grant` on the endpoint.
+pub fn send(ep: u32, words: &[u64; abi::MSG_WORDS], cap_slot: u32) -> i64 {
+    // SAFETY: the kernel checks the buffer against our own mappings.
+    unsafe { syscall(abi::SYS_SEND, ep as u64, words.as_ptr() as u64, cap_slot as u64, 0) }
+}
+
+/// Receive a message. Returns the slot a transferred capability landed in, or
+/// zero if the message carried none.
+pub fn recv(ep: u32, words: &mut [u64; abi::MSG_WORDS]) -> i64 {
+    // SAFETY: as above, and the buffer is writable by us.
+    unsafe { syscall(abi::SYS_RECV, ep as u64, words.as_mut_ptr() as u64, 0, 0) }
+}
+
+/// The cycle counter. Under emulation this is not real cycles, so only ratios
+/// between measurements taken the same way mean anything.
+#[inline]
+pub fn rdtsc() -> u64 {
+    // SAFETY: rdtsc has no operands and no side effects.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
 /// What rights does this slot carry? Lets a program find out what it may do
 /// without having to fail first.
 pub fn rights(slot: u32) -> i64 {

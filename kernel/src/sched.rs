@@ -13,7 +13,7 @@ use bramble_graph::body::{Cpu, MemoryObject, NodeBody, Root, Thread, ThreadState
 use bramble_graph::graph::Ref;
 use bramble_graph::id::NodeId;
 
-use crate::state::{BOOT, FRAMES, GRAPH};
+use crate::state::{FRAMES, GRAPH};
 
 static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
 
@@ -148,7 +148,7 @@ pub fn schedule() {
 
     let decision = {
         let mut g = GRAPH.lock();
-        let cpu: Ref<Cpu> = match g.typed(BOOT.lock().cpu0) {
+        let cpu: Ref<Cpu> = match g.typed(crate::state::cpu0()) {
             Some(c) => c,
             None => return,
         };
@@ -228,8 +228,14 @@ pub fn schedule() {
 /// the cpu moves on. The reaper returns the storage later, from another thread,
 /// which is why it is safe to do this while standing on a stack the process
 /// owns.
+/// How many processes have exited, so a watcher can tell without walking the
+/// graph on every scheduling round.
+pub static PROCESSES_EXITED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 pub fn exit_current_process(code: i32) -> ! {
     x86_64::instructions::interrupts::disable();
+    PROCESSES_EXITED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     {
         let mut g = GRAPH.lock();
         let me = current_locked(&g);
@@ -245,7 +251,7 @@ pub fn exit_current_process(code: i32) -> ! {
             let _ = g.begin_delete(owner);
         }
         let _ = g.begin_delete(me);
-        if let Some(cpu) = g.typed::<Cpu>(BOOT.lock().cpu0) {
+        if let Some(cpu) = g.typed::<Cpu>(crate::state::cpu0()) {
             if let Some(b) = g.body_mut(cpu) {
                 b.current = NodeId::NULL;
             }
@@ -258,7 +264,7 @@ pub fn exit_current_process(code: i32) -> ! {
 /// The running thread, read from a graph the caller already has locked.
 /// The spin lock is not reentrant, so calling `current()` under it would hang.
 pub fn current_locked(g: &bramble_graph::graph::Graph) -> NodeId {
-    match g.typed::<Cpu>(BOOT.lock().cpu0) {
+    match g.typed::<Cpu>(crate::state::cpu0()) {
         Some(cpu) => g.body(cpu).map(|b| b.current).unwrap_or(NodeId::NULL),
         None => NodeId::NULL,
     }
@@ -284,7 +290,7 @@ pub fn on_tick() {
 /// The currently running thread, or null.
 pub fn current() -> NodeId {
     let g = GRAPH.lock();
-    match g.typed::<Cpu>(BOOT.lock().cpu0) {
+    match g.typed::<Cpu>(crate::state::cpu0()) {
         Some(cpu) => g.body(cpu).map(|b| b.current).unwrap_or(NodeId::NULL),
         None => NodeId::NULL,
     }
@@ -297,7 +303,7 @@ pub fn exit_current() -> ! {
     {
         let mut g = GRAPH.lock();
         let _ = g.begin_delete(me);
-        if let Some(cpu) = g.typed::<Cpu>(BOOT.lock().cpu0) {
+        if let Some(cpu) = g.typed::<Cpu>(crate::state::cpu0()) {
             if let Some(b) = g.body_mut(cpu) {
                 b.current = NodeId::NULL;
             }
@@ -357,7 +363,7 @@ pub fn spawn_kernel_thread(
         t,
         MemoryObject { phys_base: phys, pages: KSTACK_PAGES, ..MemoryObject::ZERO },
     )?;
-    let cpu: Ref<Cpu> = g.typed(BOOT.lock().cpu0).ok_or(vm::VmError::StaleSpace)?;
+    let cpu: Ref<Cpu> = g.typed(crate::state::cpu0()).ok_or(vm::VmError::StaleSpace)?;
     g.make_ready(cpu, t)?;
     Ok(t)
 }
@@ -412,7 +418,7 @@ pub fn adopt_boot_thread(root: Ref<Root>) -> Result<Ref<Thread>, vm::VmError> {
     // The bootloader gave us this stack; we do not own it, so there is no
     // MemoryObject for it and `kstack_top` stays zero.
     let t = g.create_under_root(root, Thread { state: ThreadState::Running, ..Thread::ZERO })?;
-    let cpu: Ref<Cpu> = g.typed(BOOT.lock().cpu0).ok_or(vm::VmError::StaleSpace)?;
+    let cpu: Ref<Cpu> = g.typed(crate::state::cpu0()).ok_or(vm::VmError::StaleSpace)?;
     if let Some(b) = g.body_mut(cpu) {
         b.current = t.id();
     }

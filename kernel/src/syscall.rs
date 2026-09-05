@@ -60,8 +60,15 @@ pub fn init() {
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
-        "mov qword ptr [rip + {user_rsp}], rsp",
+        // One global scratch word, used for exactly two instructions with
+        // interrupts masked, and then moved onto the kernel stack. It must not
+        // stay in a global: a system call that blocks lets another thread run
+        // and return through `sysret` first, and it would take the wrong
+        // process's stack pointer with it. The user's stack pointer belongs on
+        // the *per-thread* kernel stack, like every other part of the frame.
+        "mov qword ptr [rip + {scratch}], rsp",
         "mov rsp, qword ptr [rip + {kernel_rsp}]",
+        "push qword ptr [rip + {scratch}]",  // user rsp, now per-thread
         "push r11",                  // user rflags
         "push rcx",                  // user rip
         // Everything the caller is entitled to get back. `dispatch` is an
@@ -76,12 +83,16 @@ unsafe extern "C" fn syscall_entry() {
         "push r8",
         "push r9",
         "push r10",
+        // Nine pushes leaves the stack 8 mod 16; `call` needs it 0 mod 16 so
+        // the callee sees the 8 the ABI promises.
+        "sub rsp, 8",
         // Our ABI passes arguments in rdi, rsi, rdx, r10 with the call number
         // in rax; the C ABI wants rdi, rsi, rdx, rcx, r8. Two moves bridge them,
         // and both destinations are already saved above.
         "mov rcx, r10",
         "mov r8, rax",
         "call {dispatch}",
+        "add rsp, 8",
         "pop r10",
         "pop r9",
         "pop r8",
@@ -90,9 +101,9 @@ unsafe extern "C" fn syscall_entry() {
         "pop rdi",
         "pop rcx",
         "pop r11",
-        "mov rsp, qword ptr [rip + {user_rsp}]",
+        "pop rsp",
         "sysretq",
-        user_rsp = sym crate::percpu::BRAMBLE_USER_RSP,
+        scratch = sym crate::percpu::BRAMBLE_USER_RSP,
         kernel_rsp = sym crate::percpu::BRAMBLE_KERNEL_RSP,
         dispatch = sym dispatch,
     );
@@ -193,6 +204,8 @@ extern "C" fn dispatch(a0: u64, a1: u64, a2: u64, _a3: u64, nr: u64) -> i64 {
         SYS_LOOKUP => sys_lookup(a0, a1),
         SYS_INSPECT => sys_inspect(a0, a1),
         SYS_RIGHTS => sys_rights(a0),
+        SYS_SEND => sys_send(a0, a1, a2),
+        SYS_RECV => sys_recv(a0, a1),
         _ => E_BADCALL,
     }
 }
@@ -316,6 +329,97 @@ fn sys_rights(slot: u64) -> i64 {
     match g.rights_of(proc, slot as u32) {
         Some(r) => r.0 as i64,
         None => E_BADHANDLE,
+    }
+}
+
+/// Read the eight message words out of user memory.
+fn read_words(ptr: u64) -> Option<[u64; MSG_WORDS]> {
+    let bytes = user_slice(ptr, (MSG_WORDS * 8) as u64, Prot::READ)?;
+    let mut words = [0u64; MSG_WORDS];
+    for (i, w) in words.iter_mut().enumerate() {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+        *w = u64::from_le_bytes(b);
+    }
+    Some(words)
+}
+
+fn write_words(ptr: u64, words: &[u64; MSG_WORDS]) -> bool {
+    match user_slice_mut(ptr, (MSG_WORDS * 8) as u64) {
+        Some(bytes) => {
+            for (i, w) in words.iter().enumerate() {
+                bytes[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+fn sys_send(ep_slot: u64, words_ptr: u64, cap_slot: u64) -> i64 {
+    let proc = match caller() {
+        Some(p) => p,
+        None => return E_BADHANDLE,
+    };
+    let words = match read_words(words_ptr) {
+        Some(w) => w,
+        None => return E_FAULT,
+    };
+    let (ep, cap_target, cap_rights) = {
+        let g = GRAPH.lock();
+        let ep = match g.resolve(proc, ep_slot as u32, Rights::SEND) {
+            Ok(id) => id,
+            Err(bramble_graph::graph::GraphError::MissingRights { .. }) => return E_PERM,
+            Err(_) => return E_BADHANDLE,
+        };
+        // Passing a capability needs `Grant` on the endpoint: the right to send
+        // is not by itself the right to hand out authority.
+        if cap_slot != 0 {
+            match g.rights_of(proc, ep_slot as u32) {
+                Some(r) if r.contains(Rights::GRANT) => {}
+                Some(_) => return E_PERM,
+                None => return E_BADHANDLE,
+            }
+            let target = match g.resolve(proc, cap_slot as u32, Rights::NONE) {
+                Ok(t) => t,
+                Err(_) => return E_BADHANDLE,
+            };
+            let rights = match g.rights_of(proc, cap_slot as u32) {
+                Some(r) => r,
+                None => return E_BADHANDLE,
+            };
+            (ep, target, rights)
+        } else {
+            (ep, bramble_graph::id::NodeId::NULL, Rights::NONE)
+        }
+    };
+    crate::ipc::send(proc, ep, words, cap_target, cap_rights)
+}
+
+fn sys_recv(ep_slot: u64, words_ptr: u64) -> i64 {
+    let proc = match caller() {
+        Some(p) => p,
+        None => return E_BADHANDLE,
+    };
+    if !user_range_ok((MSG_WORDS * 8) as u64, words_ptr, Prot::WRITE) {
+        return E_FAULT;
+    }
+    let ep = {
+        let g = GRAPH.lock();
+        match g.resolve(proc, ep_slot as u32, Rights::RECV) {
+            Ok(id) => id,
+            Err(bramble_graph::graph::GraphError::MissingRights { .. }) => return E_PERM,
+            Err(_) => return E_BADHANDLE,
+        }
+    };
+    match crate::ipc::recv(proc, ep) {
+        Ok((slot, words)) => {
+            if !write_words(words_ptr, &words) {
+                return E_FAULT;
+            }
+            slot as i64
+        }
+        Err(e) => e,
     }
 }
 

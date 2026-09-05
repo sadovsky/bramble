@@ -20,6 +20,20 @@ use crate::sync::IrqLock;
 pub const KERNEL_IMAGE_BASE: u64 = 0xffff_ffff_8000_0000;
 
 pub static GRAPH: IrqLock<Graph> = IrqLock::new(Graph::EMPTY);
+
+/// The cpu node's id, cached outside any lock.
+///
+/// `BOOT` is an `IrqLock`, and taking one costs a `pushfq`, a `cli` and an
+/// `sti`. That is cheap on real silicon and expensive under emulation, and the
+/// scheduler and the IPC handoff both want this id on their hottest paths. It
+/// is set once at boot and never changes, so a plain atomic is the honest
+/// representation. Listed in the non-graph register (DESIGN 4.4) with the rest.
+static CPU0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub fn cpu0() -> NodeId {
+    NodeId(CPU0.load(core::sync::atomic::Ordering::Relaxed))
+}
 pub static FRAMES: IrqLock<Option<FrameAllocator>> = IrqLock::new(None);
 static CHECKER: IrqLock<Checker> = IrqLock::new(Checker::new());
 
@@ -106,6 +120,7 @@ pub fn populate(
 
     let cpu = g.create_under_root(root, Cpu::ZERO)?;
     boot.cpu0 = cpu.id();
+    CPU0.store(cpu.id().0, core::sync::atomic::Ordering::Relaxed);
     g.link_named(root, cpu, "cpu0")?;
 
     // The kernel image and any bootloader-owned regions the firmware told us

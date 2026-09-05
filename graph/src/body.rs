@@ -156,18 +156,33 @@ pub enum ThreadState {
     Dying = 4,
 }
 
+/// One IPC message, held on the sending and receiving threads rather than in a
+/// queue. Synchronous rendezvous means a message exists only while exactly two
+/// threads are looking at it, so there is nowhere else for it to live and no
+/// way for a capability to be "in transit" inside a kernel object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct Message {
     pub words: [u64; 8],
-    /// Slot the receiver reserved for an incoming capability, or 0.
+    /// The object a transferred capability names, or null.
+    pub cap_target: crate::id::NodeId,
+    /// The rights the sender is passing on, masked by what it held.
+    pub cap_rights: u32,
+    /// Slot the capability landed in on the receiving side, or 0.
     pub cap_slot: u32,
     pub has_cap: u8,
-    pub _pad: [u8; 3],
+    pub _pad: [u8; 7],
 }
 
 impl Message {
-    pub const ZERO: Message = Message { words: [0; 8], cap_slot: 0, has_cap: 0, _pad: [0; 3] };
+    pub const ZERO: Message = Message {
+        words: [0; 8],
+        cap_target: crate::id::NodeId::NULL,
+        cap_rights: 0,
+        cap_slot: 0,
+        has_cap: 0,
+        _pad: [0; 7],
+    };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -201,7 +201,7 @@ pub fn threads_and_preemption() {
     {
         let mut g = GRAPH.lock();
         g.begin_delete(boot.id()).expect("delete boot thread");
-        if let Some(cpu) = g.typed::<Cpu>(crate::state::BOOT.lock().cpu0) {
+        if let Some(cpu) = g.typed::<Cpu>(crate::state::cpu0()) {
             if let Some(b) = g.body_mut(cpu) {
                 b.current = bramble_graph::id::NodeId::NULL;
             }
@@ -228,7 +228,7 @@ fn scheduler_decision_benchmark(root: Ref<bramble_graph::body::Root>) -> (f64, f
     let mut dummies = [bramble_graph::id::NodeId::NULL; QUEUED];
     {
         let mut g = GRAPH.lock();
-        let cpu: Ref<Cpu> = g.typed(crate::state::BOOT.lock().cpu0).expect("cpu");
+        let cpu: Ref<Cpu> = g.typed(crate::state::cpu0()).expect("cpu");
         for slot in dummies.iter_mut() {
             let t = g.create_under_root(root, Thread::ZERO).expect("thread node");
             g.make_ready(cpu, t).expect("queue");
@@ -245,7 +245,7 @@ fn scheduler_decision_benchmark(root: Ref<bramble_graph::body::Root>) -> (f64, f
     for _ in 0..RUNS {
         let sample = {
             let mut g = GRAPH.lock();
-            let cpu: Ref<Cpu> = g.typed(crate::state::BOOT.lock().cpu0).expect("cpu");
+            let cpu: Ref<Cpu> = g.typed(crate::state::cpu0()).expect("cpu");
             let start = crate::time::rdtsc();
             for _ in 0..ITERS {
                 core::hint::black_box(g.pick_and_rotate(cpu));
@@ -496,7 +496,7 @@ pub fn userspace(modules: &[&limine::file::File]) {
     {
         let mut g = GRAPH.lock();
         g.begin_delete(boot.id()).expect("delete boot thread");
-        if let Some(cpu) = g.typed::<Cpu>(crate::state::BOOT.lock().cpu0) {
+        if let Some(cpu) = g.typed::<Cpu>(crate::state::cpu0()) {
             if let Some(b) = g.body_mut(cpu) {
                 b.current = NodeId::NULL;
             }
@@ -513,4 +513,180 @@ pub fn userspace(modules: &[&limine::file::File]) {
         "proc: free frames {} before, {} after two processes lived and died",
         baseline, after_faulter
     );
+}
+
+// ---------------------------------------------------------------- phase 6 ---
+
+use bramble_graph::body::Endpoint;
+use bramble_graph::id::EdgeKind;
+use core::sync::atomic::Ordering as AtomicOrdering;
+
+/// How many `Waiting` edges exist right now. With synchronous rendezvous this
+/// is the number of threads parked on an endpoint, and watching it change is
+/// watching the conversation happen.
+fn waiting_edges() -> u32 {
+    let g = GRAPH.lock();
+    let mut n = 0;
+    for eid in g.live_edges() {
+        if g.edge(eid).and_then(|e| e.edge_kind()) == Some(EdgeKind::Waiting) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Phase 6: two processes talking over an endpoint, and the last of the
+/// performance gates.
+pub fn ipc(modules: &[&limine::file::File]) {
+    let baseline = free_frames();
+    let (root, console) = {
+        let g = GRAPH.lock();
+        let boot = crate::state::BOOT.lock();
+        (g.root().expect("root"), boot.console)
+    };
+    let boot = crate::sched::adopt_boot_thread(root).expect("boot thread");
+
+    // Two endpoints, one per direction, so a message can never be collected by
+    // the process that sent it.
+    let (a2b, b2a) = {
+        let mut g = GRAPH.lock();
+        let a = g.create_under_root(root, Endpoint::ZERO).expect("endpoint");
+        let b = g.create_under_root(root, Endpoint::ZERO).expect("endpoint");
+        g.link_named(root, a, "ping-to-pong").expect("name");
+        g.link_named(root, b, "pong-to-ping").expect("name");
+        (a.id(), b.id())
+    };
+    state::assert_consistent("after creating the endpoints");
+    println!("ipc:  endpoints {:?} and {:?} created", a2b, b2a);
+
+    let ponger_elf = find_module(modules, "ponger").expect("the ponger module is missing");
+    let pinger_elf = find_module(modules, "pinger").expect("the pinger module is missing");
+
+    x86_64::instructions::interrupts::enable();
+    crate::ipc::reset_handoff_stats();
+
+    // The ponger starts with no console at all. Its only authority is one
+    // endpoint it may receive on and one it may send on; everything else it
+    // ever does has to arrive in a message.
+    let ponger = crate::proc::spawn(
+        root,
+        ponger_elf,
+        &[(a2b, Rights::RECV), (b2a, Rights::SEND)],
+    )
+    .unwrap_or_else(|e| panic!("could not spawn ponger: {}", e.describe()));
+
+    // The pinger may send on a2b *and* hand out capabilities through it, which
+    // is a separate right from being allowed to send.
+    let pinger = crate::proc::spawn(
+        root,
+        pinger_elf,
+        &[
+            (console, Rights::READ.union(Rights::WRITE)),
+            (a2b, Rights::SEND.union(Rights::GRANT)),
+            (b2a, Rights::RECV),
+        ],
+    )
+    .unwrap_or_else(|e| panic!("could not spawn pinger: {}", e.describe()));
+    state::assert_consistent("after spawning both");
+    println!("ipc:  ponger {:?}, pinger {:?}, both running", ponger.id(), pinger.id());
+    println!();
+
+    // Watch the conversation from outside it. Every sample where a `Waiting`
+    // edge exists is a moment one process is parked on an endpoint, which in a
+    // conventional kernel is a wait queue nothing outside that subsystem can
+    // see, and here is one edge in the same graph as everything else.
+    //
+    // Sampling has to be rare. This thread shares the run queue with the two
+    // being measured, so anything it does on every scheduling round lands
+    // inside their round-trip time. Checking an atomic counter costs nothing;
+    // walking the edge set costs more than the thing being measured.
+    const SAMPLE_EVERY: u32 = 64;
+    let start_exits = crate::sched::PROCESSES_EXITED.load(AtomicOrdering::Relaxed);
+    let mut rounds = 0u32;
+    let mut samples = 0u32;
+    let mut observed_waiting = 0u32;
+    let mut max_waiting = 0u32;
+    let deadline = crate::time::ticks() + 6000;
+    loop {
+        crate::sched::yield_now();
+        rounds += 1;
+        if crate::sched::PROCESSES_EXITED.load(AtomicOrdering::Relaxed) >= start_exits + 2 {
+            break;
+        }
+        if rounds.is_multiple_of(SAMPLE_EVERY) {
+            reaper::drain();
+            let w = waiting_edges();
+            samples += 1;
+            if w > 0 {
+                observed_waiting += 1;
+            }
+            max_waiting = max_waiting.max(w);
+            assert!(crate::time::ticks() < deadline, "the ping-pong never finished");
+        }
+    }
+    x86_64::instructions::interrupts::disable();
+    reaper::drain();
+
+    println!();
+    println!(
+        "ipc:  watched from outside: {} of {} samples caught a thread parked on an endpoint, at most {} at once",
+        observed_waiting, samples, max_waiting
+    );
+    assert!(observed_waiting > 0, "never saw a Waiting edge; the rendezvous is not being modelled");
+
+    let (cycles, handoffs) = crate::ipc::handoff_stats();
+    assert!(handoffs > 0, "no rendezvous were completed");
+    let overhead = crate::ipc::timing_overhead();
+    let raw = cycles / handoffs;
+    let net = raw.saturating_sub(overhead);
+    println!("ipc:  {} rendezvous completed", handoffs);
+    println!("      graph work per rendezvous  {:>8} cycles measured", raw);
+    println!("      timing reads themselves    {:>8} cycles", overhead);
+    println!("      graph work, net            {:>8} cycles", net);
+    let (find, deliver, wake) = crate::ipc::handoff_breakdown();
+    println!("        find the waiter          {:>8} cycles", find / handoffs);
+    println!("        copy the message         {:>8} cycles", deliver / handoffs);
+    println!("        requeue the partner      {:>8} cycles", wake / handoffs);
+
+    // The gate. Elapsed time is measured between the first and last rendezvous
+    // in the same clock as the handoffs themselves, so this is the share of the
+    // whole conversation spent inside graph operations, with no figure carried
+    // across the system-call boundary.
+    //
+    // It is an upper bound on what the *graph* costs, not a measure of it: a
+    // conventional kernel doing the same rendezvous still has to find a waiter,
+    // copy the message and requeue the partner. What the graph adds is the
+    // difference between doing that with typed edges and doing it with two
+    // pointers, and that difference is smaller than this number.
+    let total = crate::ipc::elapsed();
+    let share = (100 * cycles).checked_div(total).unwrap_or(0);
+    println!("      elapsed across the whole conversation {} cycles", total);
+    println!("      graph work as a share of it           {}%", share);
+    if !cfg!(debug_assertions) {
+        assert!(
+            share < 15,
+            "graph operations are {}% of message passing; DESIGN 5.3's fallback applies to Waiting",
+            share
+        );
+    } else {
+        println!("      (debug build: gate reported, not enforced)");
+    }
+
+    state::assert_consistent("after the conversation ended");
+    {
+        let mut g = GRAPH.lock();
+        g.begin_delete(a2b).expect("delete endpoint");
+        g.begin_delete(b2a).expect("delete endpoint");
+        g.begin_delete(boot.id()).expect("delete boot thread");
+        if let Some(cpu) = g.typed::<Cpu>(crate::state::cpu0()) {
+            if let Some(b) = g.body_mut(cpu) {
+                b.current = NodeId::NULL;
+            }
+        }
+    }
+    reaper::drain();
+    state::assert_consistent("after phase 6 teardown");
+    let after = free_frames();
+    assert_eq!(after, baseline, "phase 6 leaked frames");
+    cprintln!(fb::ACCENT, "ipc:  two processes shared nothing but two edges");
 }

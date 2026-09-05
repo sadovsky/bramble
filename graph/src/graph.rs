@@ -437,6 +437,23 @@ impl Graph {
             }
         }
 
+        self.link_prechecked(src, kind, dst, data)
+    }
+
+    /// The linking half of `link_raw`, without the validation.
+    ///
+    /// Only for callers that have just run `precheck_link` on the same triple
+    /// and have done nothing since that could invalidate it. Between the two,
+    /// unlinking is the only thing permitted: it can free capacity but cannot
+    /// make a node stale or dying. Splitting these matters because the two
+    /// together were doing every check twice on the hottest path in the kernel.
+    fn link_prechecked(
+        &mut self,
+        src: NodeId,
+        kind: EdgeKind,
+        dst: NodeId,
+        data: RawEdgeData,
+    ) -> Result<EdgeId> {
         let (ei, eg) = self.edges.alloc().ok_or(GraphError::EdgeArenaFull)?;
         {
             let e = self.edges.at_mut(ei);
@@ -475,26 +492,25 @@ impl Graph {
 
         match kind {
             EdgeKind::Holds => {
-                // Keep the handle table consistent (I8).
+                // Keep the handle table consistent (I8). The endpoint kinds are
+                // fixed by the edge kind, so there is no need to re-check them;
+                // `body_mut` still validates the slot and its generation.
                 let slot = HoldsAttr::decode(e.data).slot;
-                if let Some(p) = self.typed::<Process>(e.src) {
-                    if let Some(b) = self.body_mut(p) {
-                        if (slot as usize) < HANDLE_SLOTS && b.handles[slot as usize] == ei {
-                            b.handles[slot as usize] = 0;
-                        }
+                let p: Ref<Process> = Ref::from_raw(e.src);
+                if let Some(b) = self.body_mut(p) {
+                    if (slot as usize) < HANDLE_SLOTS && b.handles[slot as usize] == ei {
+                        b.handles[slot as usize] = 0;
                     }
                 }
             }
             EdgeKind::Maps => {
-                if let Some(m) = self.typed::<MemoryObject>(e.dst) {
-                    if let Some(b) = self.body_mut(m) {
-                        b.map_count = b.map_count.saturating_sub(1);
-                    }
+                let m: Ref<MemoryObject> = Ref::from_raw(e.dst);
+                if let Some(b) = self.body_mut(m) {
+                    b.map_count = b.map_count.saturating_sub(1);
                 }
-                if let Some(s) = self.typed::<AddressSpace>(e.src) {
-                    if let Some(b) = self.body_mut(s) {
-                        b.mapping_count = b.mapping_count.saturating_sub(1);
-                    }
+                let s: Ref<AddressSpace> = Ref::from_raw(e.src);
+                if let Some(b) = self.body_mut(s) {
+                    b.mapping_count = b.mapping_count.saturating_sub(1);
                 }
             }
             EdgeKind::Waiting => {
@@ -502,20 +518,18 @@ impl Graph {
                 // wait is being cancelled. Either way the thread must not stay
                 // Blocked with no edge to show for it (invariant I6). It goes
                 // Inert with a flag, and the kernel requeues it with an error.
-                if let Some(t) = self.typed::<Thread>(e.src) {
-                    if let Some(b) = self.body_mut(t) {
-                        if b.state == ThreadState::Blocked {
-                            b.state = ThreadState::Inert;
-                            b.wait_aborted = 1;
-                        }
+                let t: Ref<Thread> = Ref::from_raw(e.src);
+                if let Some(b) = self.body_mut(t) {
+                    if b.state == ThreadState::Blocked {
+                        b.state = ThreadState::Inert;
+                        b.wait_aborted = 1;
                     }
                 }
             }
             EdgeKind::InSpace => {
-                if let Some(t) = self.typed::<Thread>(e.src) {
-                    if let Some(b) = self.body_mut(t) {
-                        b.cr3 = 0;
-                    }
+                let t: Ref<Thread> = Ref::from_raw(e.src);
+                if let Some(b) = self.body_mut(t) {
+                    b.cr3 = 0;
                 }
             }
             EdgeKind::Owns => {
@@ -671,6 +685,35 @@ impl Graph {
         Ok(slot)
     }
 
+    /// Install a capability named by a raw id, checking the kind at runtime.
+    ///
+    /// The typed `grant` is preferable wherever the caller knows what it holds.
+    /// This exists for the two places that do not: message passing, where the
+    /// capability being transferred is whatever the sender had, and process
+    /// creation, where the grants come from a table.
+    pub fn grant_raw(
+        &mut self,
+        holder: Ref<Process>,
+        target: NodeId,
+        rights: Rights,
+    ) -> Result<u32> {
+        let tk = target.kind().ok_or(GraphError::StaleNode(target))?;
+        if !compatible(EdgeKind::Holds, NodeKind::Process, tk) {
+            return Err(GraphError::Incompatible {
+                kind: EdgeKind::Holds,
+                src: NodeKind::Process,
+                dst: tk,
+            });
+        }
+        let slot = self.find_free_slot(holder)?;
+        let attr = HoldsAttr { rights, slot };
+        let e = self.link_raw(holder.id, EdgeKind::Holds, target, attr.encode())?;
+        let b = self.body_mut(holder).ok_or(GraphError::StaleNode(holder.id))?;
+        b.handles[slot as usize] = e.idx();
+        b.next_slot_hint = slot + 1;
+        Ok(slot)
+    }
+
     fn find_free_slot(&self, p: Ref<Process>) -> Result<u32> {
         let b = self.body(p).ok_or(GraphError::StaleNode(p.id))?;
         // Slot 0 is reserved as the null handle.
@@ -779,7 +822,7 @@ impl Graph {
         if let Some(e) = self.ready_edge(t) {
             self.unlink(e)?;
         }
-        self.link_raw(cpu.id, EdgeKind::Ready, t.id, ReadyAttr::default().encode())?;
+        self.link_prechecked(cpu.id, EdgeKind::Ready, t.id, ReadyAttr::default().encode())?;
         self.body_mut(t).unwrap().state = ThreadState::Ready;
         Ok(())
     }
@@ -808,7 +851,7 @@ impl Graph {
         if let Some(e) = self.waiting_edge(t) {
             self.unlink(e)?;
         }
-        self.link_raw(t.id, EdgeKind::Waiting, on.id, attr.encode())?;
+        self.link_prechecked(t.id, EdgeKind::Waiting, on.id, attr.encode())?;
         self.body_mut(t).ok_or(GraphError::StaleNode(t.id))?.state = ThreadState::Blocked;
         Ok(())
     }
@@ -816,17 +859,23 @@ impl Graph {
     /// Normal wakeup: end a wait and queue the thread. Distinct from having the
     /// wait torn down under it, which sets `wait_aborted`.
     pub fn wake(&mut self, cpu: Ref<Cpu>, t: Ref<Thread>) -> Result<()> {
+        // Deliberately not `make_ready` after an unlink: that would repeat the
+        // validation and both edge lookups a second time, and this is the
+        // hottest path in message passing. Doing the work once is worth the
+        // duplication of four lines.
         self.precheck_link(cpu.id, EdgeKind::Ready, t.id)?;
         if let Some(e) = self.waiting_edge(t) {
             self.unlink(e)?;
         }
+        if let Some(e) = self.ready_edge(t) {
+            self.unlink(e)?;
+        }
+        self.link_prechecked(cpu.id, EdgeKind::Ready, t.id, ReadyAttr::default().encode())?;
         if let Some(b) = self.body_mut(t) {
             b.wait_aborted = 0;
-            if b.state == ThreadState::Inert {
-                b.state = ThreadState::Blocked; // so make_ready accepts it
-            }
+            b.state = ThreadState::Ready;
         }
-        self.make_ready(cpu, t)
+        Ok(())
     }
 
     /// The scheduler's pick-next: the head of the cpu's `Ready` list. One load.

@@ -15,6 +15,7 @@ mod fb;
 mod font;
 mod frames;
 mod inspect;
+mod ipc;
 mod paging;
 mod percpu;
 mod print;
@@ -281,8 +282,14 @@ extern "C" fn kmain() -> ! {
     println!();
     dump::dump_graph();
 
+    // ---- phase 6: ipc ----
     println!();
-    cprintln!(fb::ACCENT, "phase 5 complete. halting.");
+    selftest::ipc(modules);
+    println!();
+    dump::dump_graph();
+
+    println!();
+    cprintln!(fb::ACCENT, "phase 6 complete. halting.");
     halt_forever();
 }
 

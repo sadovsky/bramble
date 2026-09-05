@@ -14,7 +14,7 @@ use bramble_graph::graph::Ref;
 use crate::elf::{self, PF_R, PF_W, PF_X};
 use crate::paging::{self, PAGE_SIZE};
 use crate::sched;
-use crate::state::{BOOT, GRAPH};
+use crate::state::GRAPH;
 use crate::vm::{self, VmError};
 
 /// Where a user stack lives. High in the user half, far from any program text.
@@ -292,24 +292,10 @@ pub fn spawn(
 
     // Authority. Everything this program can ever do starts here.
     for (target, rights) in grants {
-        let slot = match target.kind() {
-            Some(bramble_graph::id::NodeKind::Device) => {
-                g.typed::<Device>(*target).map(|d| g.grant(proc, d, *rights))
-            }
-            Some(bramble_graph::id::NodeKind::Root) => {
-                g.typed::<Root>(*target).map(|r| g.grant(proc, r, *rights))
-            }
-            Some(bramble_graph::id::NodeKind::Endpoint) => {
-                g.typed::<Endpoint>(*target).map(|e| g.grant(proc, e, *rights))
-            }
-            _ => None,
-        };
-        if let Some(Err(e)) = slot {
-            return Err(SpawnError::Graph(e));
-        }
+        g.grant_raw(proc, *target, *rights)?;
     }
 
-    let cpu: Ref<Cpu> = g.typed(BOOT.lock().cpu0).ok_or(VmError::StaleSpace)?;
+    let cpu: Ref<Cpu> = g.typed(crate::state::cpu0()).ok_or(VmError::StaleSpace)?;
     g.make_ready(cpu, thread)?;
     let _ = abi::R_READ;
     Ok(proc)

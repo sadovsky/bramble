@@ -27,8 +27,9 @@ Start here:
 | 3 | Address spaces, and page tables proven to match the graph | done |
 | 4 | Threads, preemption, and the fast-path gate | done |
 | 5 | Userspace: ring 3, processes, capabilities | done |
-| 6 | IPC over an endpoint | next |
-| 7-8 | Lifecycle, naming, v1 | planned |
+| 6 | IPC over an endpoint, with capability transfer | done |
+| 7 | Lifecycle and naming from userspace | next |
+| 8 | v1: the inspectable kernel | planned |
 
 ```
 cargo ktest             # graph crate tests, on the host

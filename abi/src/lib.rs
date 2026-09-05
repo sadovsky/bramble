@@ -29,6 +29,14 @@ pub const SYS_WRITE: u64 = 2;
 pub const SYS_LOOKUP: u64 = 3;
 pub const SYS_INSPECT: u64 = 4;
 pub const SYS_RIGHTS: u64 = 5;
+/// send(endpoint_slot, words_ptr, capability_slot_or_zero) -> 0
+pub const SYS_SEND: u64 = 6;
+/// recv(endpoint_slot, words_ptr) -> slot the received capability landed in, or 0
+pub const SYS_RECV: u64 = 7;
+
+/// Words in one IPC message. Sized to be copied without ceremony; anything
+/// larger is what shared memory and a capability to it are for.
+pub const MSG_WORDS: usize = 8;
 
 // --------------------------------------------------------------- errors ---
 // Returned as a negative value in the syscall's return register.

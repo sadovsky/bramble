@@ -574,3 +574,74 @@ stop two segments sharing a page.
 **Risk retired:** the ABI plumbing the plan expected to be the phase most
 likely to eat a weekend on one bug. It ate several, and every one of them was
 in the conventional machinery rather than in anything to do with the graph.
+
+### Phase 6: IPC, and the last performance gate — **done**
+
+Synchronous rendezvous over endpoints. A message lives on the sending thread's
+node until a receiver takes it, so there is no queue, no node churn per message,
+and no way for a capability to sit in transit inside a kernel object where the
+ownership tree cannot see it. An endpoint's entire state is its `Waiting`
+in-list.
+
+Two user programs, `pinger` and `ponger`, share nothing: no memory, no names,
+no filesystem. They can reach each other only because each was handed a
+capability to the same pair of endpoints, one per direction. The ponger starts
+with **no console at all** and is handed one in the first message, which is
+capability transfer doing something a conventional kernel cannot: authority
+arriving in a message rather than being configured in advance.
+
+Sending a capability requires `Grant` **on the endpoint**, separately from
+`Send`. Being allowed to talk is not the same as being allowed to hand out
+authority.
+
+Measured, release build under TCG:
+
+| Measurement | Value |
+|---|---|
+| Round trip, measured in userspace | 155210 cycles |
+| Two null system calls | 1435 cycles |
+| Graph work per rendezvous | 7081 cycles |
+| — find the waiter | 1270 |
+| — copy the message | 767 |
+| — requeue the partner | 5131 |
+| **Graph work as a share of the whole conversation** | **8%** |
+
+**Verdict: go**, against a gate of 15%. Note what the number is: an *upper
+bound* on the graph's cost, not a measure of it. Any kernel doing this
+rendezvous must find a waiter, copy a message and requeue a partner; what the
+graph adds is the difference between doing that with typed edges and doing it
+with two pointers, which is smaller than 8%.
+
+It started at 13%, and closing the gap needed two changes, both of the same
+kind as phase 4's:
+
+- `precheck_link` and `link_raw` were validating the same triple twice on every
+  edge creation. Splitting the linking half out, for callers that have just
+  prechecked, removed a whole duplicate pass.
+- `unlink`'s per-kind bookkeeping was re-deriving endpoint kinds that the edge
+  kind already fixes (invariant I3), costing an extra node lookup each time.
+
+Together: 9602 to 7081 cycles per rendezvous, and the phase 4 context switch
+improved from 4953 to 4101 as a side effect.
+
+**The bug that mattered: a global where a per-thread slot was needed.** The
+system-call entry stub parked the user's stack pointer in a single global while
+it switched to the kernel stack. That is fine until a system call *blocks*:
+another thread runs, returns through `sysret` first, and takes the wrong
+process's stack pointer back to ring 3 with it. The symptom was a message
+arriving with the value the sender held one step earlier, and it moved when
+unrelated code was added, which is the signature of state shared where it should
+not be. The user's stack pointer now goes on the per-thread kernel stack with
+the rest of the frame; the global is live for exactly two instructions.
+
+**Also worth recording:** the measurement harness was, at first, most of what it
+measured. The watching thread shares the run queue with the two being timed, so
+walking the edge set on every scheduling round landed inside their round-trip
+time. It now checks an atomic counter every round and samples the graph rarely.
+And the first set of numbers was taken from a debug build, where a context
+switch costs 88693 cycles against release's 4101 — a reminder to read the
+profile before reading the number.
+
+**Risk retired:** the representation is now committed. This was the last point
+at which `Waiting` could have been demoted to fields without rewriting
+userspace, and it does not need to be.
