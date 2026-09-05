@@ -1,0 +1,268 @@
+# Bramble: Staged Implementation Plan
+
+Companion to `docs/DESIGN.md`. Nine phases from a blank repo to the v1 goal:
+two userspace processes running preemptively, communicating over an IPC
+edge, with the entire kernel state inspectable as a graph via a syscall.
+
+## Ordering principle
+
+The riskiest assumption is that the graph representation is cheap enough on
+the context-switch and IPC paths. The second riskiest is that derived
+indices (page tables above all) can be kept consistent with edges. The plan
+therefore:
+
+- builds and **benchmarks the graph on the host in phase 1**, before any
+  kernel code depends on it. The primitive costs (link, unlink, lookup)
+  predict the in-kernel numbers because a context switch's other costs
+  (register save, CR3 load) are fixed and known;
+- ships the **checker in phase 1** and the first derived index (page tables)
+  in phase 3, so no index ever exists without its auditor;
+- takes the first **in-kernel fast-path measurement in phase 4**, with a
+  named fallback if it fails;
+- takes the **IPC measurement in phase 6**, the last point at which the
+  representation could still be swapped without rewriting userspace.
+
+Every phase has a milestone you can watch in QEMU or in a terminal, and a
+go/no-go where one applies. Phases are sized for roughly one to three
+focused weekends each; take the ordering seriously and the estimates lightly.
+
+## Repository layout (established in phase 0/1)
+
+```
+bramble/
+  Cargo.toml                 workspace
+  kernel/                    the kernel binary, x86_64-unknown-none
+  graph/                     bramble-graph: no_std, host-testable, no kernel deps
+  user/                      bramble-user: syscall wrappers + the v1 programs
+  tools/                     host tools: snapshot decoder, DOT renderer, checker
+  limine.conf, scripts/qemu.sh, scripts/bench.sh
+  docs/
+```
+
+`graph/` never depends on `kernel/`. The kernel calls into `graph/` through
+a small trait for the platform-specific hooks (write a PTE, flush TLB) so
+the checker's page-table cross-check can be mocked on the host.
+
+---
+
+## Phase 0: boots to a framebuffer
+
+**Build.** Rust nightly, `x86_64-unknown-none` target, Limine boot protocol
+via the `limine` crate. GDT, IDT with a panic-printing exception handler,
+TSS, serial output over COM1, framebuffer text output. A `qemu.sh` that boots
+the image with serial on stdio, and a `-enable-kvm` variant.
+
+**Milestone.** "Bramble" drawn on the QEMU framebuffer; the same line plus
+the Limine memory map on the serial console; a deliberate `ud2` prints a
+register dump instead of triple-faulting.
+
+**Risk.** Toolchain churn (Limine protocol revisions, nightly features for
+`naked` functions and the custom target). Low impact, but it is where hobby
+kernels most often die of boredom, so keep it to one sitting.
+
+---
+
+## Phase 1: the graph crate, on the host
+
+**Build.** `bramble-graph` as a `no_std` library with `std` enabled only for
+tests: slabs, generational IDs, orthogonal edge lists, the `EdgeKind` trait
+with the v1 compatibility table, `create_node`/`link`/`unlink`/
+`retarget_src`/`move_to_tail`/two-phase `delete_node`, and the **checker**
+verifying invariants I1 to I4, I6, I8, I9 (everything that does not need
+hardware). Property tests: random operation sequences with the checker run
+after every step. Fuzz the ID validation: stale IDs must always fail.
+Criterion benchmarks for each primitive.
+
+**Milestone.** `cargo test -p bramble-graph` green with the property suite;
+`cargo bench` prints per-op costs.
+
+**Go/no-go.** `link`/`unlink`/`lookup` each under ~30 ns on the host with a
+warm cache, and under ~150 ns cold. If cold `lookup` is materially worse than
+a pointer chase (it should be one extra compare), the layout is wrong; fix
+it here, where fixing it is a refactor rather than a rewrite.
+
+**Risk.** The representation is wrong in a way the host cannot show
+(interrupt-context latency, cache behaviour under real workloads). Mitigated
+by phases 4 and 6; accepted otherwise.
+
+---
+
+## Phase 2: physical memory and the graph in the kernel
+
+**Build.** Frame bitmap allocator over the Limine memory map. The static
+`GRAPH` in `.bss`, `Root` and `Cpu0` nodes, Root-owned `MemoryObject` nodes
+for the kernel image, framebuffer, bitmap, and each boot module. A text
+dump of the graph over serial (`node kind id` / `edge kind src dst`), which
+is the inspect syscall's format minus the syscall. The in-kernel checker
+runs at the end of boot.
+
+**Milestone.** Boot prints the graph: `Root Owns Cpu0`, `Root Owns
+MemoryObject(kernel_image)`, and so on; the checker reports clean; the
+serial dump round-trips through a host tool into a Graphviz picture.
+
+**Risk.** Bootstrapping order: something needs a frame before the bitmap
+exists, or a node before the graph is declared. Both are visible in this
+phase and cheap to fix. Arena sizing is checked against the memory map here.
+
+---
+
+## Phase 3: address spaces, `Maps` edges, and the page-table invariant
+
+**Build.** The kernel's own page tables (replace Limine's), the kernel
+`AddressSpace` node with its two fixed `Maps` edges, `link::<Maps>` and
+`unlink::<Maps>` as the only writers of user PTEs, TLB shootdown (local only
+in v1), and the checker's page-table walk implementing I5 and I7 on user
+spaces. Create a throwaway user `AddressSpace`, map a `MemoryObject` into
+it, unmap it.
+
+**Milestone.** Map, checker clean; corrupt a PTE by hand from a debug hook,
+checker panics naming the space, the edge, and the mismatched PTE. Unmap,
+checker clean. This is the first proof that a derived index can be kept
+honest.
+
+**Risk.** I5 is hard to hold across TLB corners (stale entries after an
+unmap look like the invariant holding when it does not). Local-only flushes
+in v1 keep it tractable; the checker cannot see the TLB, so a stale-TLB test
+(write after unmap must fault) is added to the milestone.
+
+---
+
+## Phase 4: threads, preemption, and the first fast-path measurement
+
+**Build.** `Thread` nodes with kernel stacks, `InSpace` edges with the `cr3`
+hot-hop cache, the `Cpu`'s `Ready` list, `set_state`, the context switch
+with lock hand-off, the LAPIC timer calibrated against the PIT, and the
+reaper thread. Two kernel threads alternate on timer ticks. A benchmark
+mode: each thread yields to the other N times and the kernel prints the
+mean cycles per switch from `rdtsc`. A control build with a hand-rolled
+intrusive list scheduler (candidate B for this one edge kind) for the ratio.
+
+**Milestone.** Serial shows the two threads interleaving on ticks, the
+checker verifying I6 every tick in debug builds, and a table of switch cost
+for the graph scheduler versus the control.
+
+**Go/no-go.** Graph scheduler within 1.5× of the control under KVM. If it
+fails: the fallback is to hoist `Ready` into a field-based list on `Cpu`
+and `Thread` while still emitting it as edges in inspect (candidate B for
+that edge kind only). That fallback is small and does not touch the thesis
+elsewhere; decide it here, not in phase 8.
+
+**Risk.** This is the point where the thesis is first tested against
+hardware. Also the usual: stack switching bugs that show up as triple
+faults; QEMU TCG making the numbers noise (use KVM).
+
+---
+
+## Phase 5: userspace
+
+**Build.** Ring 3 entry and return, `SYSCALL`/`SYSRET` with `swapgs` and a
+per-CPU kernel stack, `Process` nodes with the handle table, `Holds` edges
+and rights checks, a static ELF64 loader from a Limine module, the
+`Device` node for the serial console, and the syscalls `exit`, `yield`,
+`write`, `lookup`, `inspect`. The `bramble-user` crate. One program: print
+hello via a console capability, then dump the graph via `inspect` and print
+it as text.
+
+**Milestone.** A user program prints "hello from ring 3" through a
+capability; the same program built without the `write` right gets an error
+and exits; a user page fault kills the process and the reaper cleans up
+with the checker clean afterwards. The user program's own `inspect` output
+matches the kernel's serial dump.
+
+**Risk.** ABI plumbing (user stack alignment, `swapgs` on every path
+including exceptions in user mode, `sysret` canonical-address trap). Not a
+design risk, just the phase most likely to eat a weekend on one bug.
+
+---
+
+## Phase 6: IPC, and the second fast-path measurement
+
+**Build.** `Endpoint` nodes, `Waiting` edges with role and FIFO order,
+`send`/`recv`/`call` with synchronous rendezvous, direct switch to the
+partner, capability transfer with rights masking and slot allocation,
+`endpoint_create`. Two user programs loaded as two modules, each given an
+endpoint capability by the kernel at boot (spawn from userspace arrives in
+phase 7). A ping-pong benchmark: one million round trips, cycles per round
+trip printed.
+
+**Milestone.** Two processes ping-pong over an endpoint; `inspect` shows the
+`Waiting` edge flipping between them; the checker runs clean between
+batches; a round-trip number.
+
+**Go/no-go.** Under KVM, a round trip of a few thousand cycles is expected
+for a first cut; over ten thousand means the graph ops are not the problem
+and something else is (usually a redundant CR3 load or a TLB flush on the
+switch path), and profiling continues. If the graph ops themselves show up
+as more than ~15 percent of the round trip in a cycle breakdown, apply the
+phase 4 fallback to the `Waiting` edge kind as well.
+
+**Risk.** Capability-transfer semantics: the slot reserved by the receiver
+before blocking, rights masking, and what happens when the sender dies
+mid-rendezvous (the `DYING` check on the far side handles it, but it needs a
+test). Also the last point where the representation could be changed
+without rewriting user programs; after this phase the design is committed.
+
+---
+
+## Phase 7: lifecycle, naming, and cleanup
+
+**Build.** `spawn`/`start`/`grant`/`mem_create`/`map` from userspace, so
+init creates the two workers itself. Process exit with full two-phase
+deletion through the reaper. `Named` edges from `Root`, `lookup`. Revocation
+tests: kill a process holding the endpoint and confirm the partner's next
+`send` returns an error rather than deadlocking; kill a parent and confirm
+the child subtree is gone; check the slab occupancy returns to the pre-spawn
+count.
+
+**Milestone.** init spawns two workers, hands each an endpoint, they
+ping-pong, init kills one, the other's `send` fails cleanly, init respawns
+it, and a snapshot after everything exits is identical (modulo generations)
+to a snapshot from before. Occupancy counts prove no leak.
+
+**Risk.** Unbounded work under the lock, which the reaper design addresses
+but which needs a test with a process owning thousands of objects, plus
+cascading deletion ordering bugs (child freed before parent's edge to it is
+unlinked). The checker catches the second class; a lock-hold-time histogram
+catches the first.
+
+---
+
+## Phase 8: v1, the inspectable kernel
+
+**Build.** The final `inspect` snapshot format (header, node table, sorted
+edge table with offsets, virtual edges). The host tools: decode, render to
+DOT, diff two snapshots, run the checker's invariants offline, and answer
+the take-grant "could A ever obtain X" query. A user-triggered debug syscall
+that runs the in-kernel checker on demand.
+
+**Milestone (v1).** With init and two workers ping-ponging under preemption,
+a user program takes a snapshot; on the host it renders as a graph showing
+`Root`, `Cpu0` with its `Ready` list, three processes with their `Owns` and
+`Holds` edges, four address spaces with `Maps` edges, the endpoint with its
+`Waiting` edge, and the console device with its `Named` edge. The offline
+checker agrees with the in-kernel one. Two snapshots a second apart diff to
+exactly the `Ready`/`Waiting` flips.
+
+**Risk.** Snapshot consistency under the lock (hold time grows with graph
+size) and a user buffer that is too small. Both are engineering, not design.
+
+---
+
+## Phase 9 (post-v1 candidates, in suggested order)
+
+Not part of v1. Listed so the v1 design does not paint itself out of them.
+
+1. **Lazy mapping and the per-space range index**, which also enables
+   demand-zero memory and copy-on-write `MemoryObject`s (a `Maps` edge
+   attribute plus a fault handler that consults the index, never the graph).
+2. **Async notifications** as a bitmask on `Endpoint`, so an interrupt can
+   signal a userspace driver without a blocked receiver.
+3. **Chunked slab growth** from the frame allocator.
+4. **SMP**: `Cpu` nodes with their own locks, cross-CPU TLB shootdown, thread
+   migration as `retarget_src` on a `Ready` edge, and the global lock
+   retreating to structural mutations. The lock audit from design section
+   3.8 is the entry criterion.
+5. **Reparenting and orphan semantics** as a distinct edge kind if `Owns` as
+   parentage proves too rigid.
+6. **Persistence**, only after a separate design document. Do not start it
+   as a weekend project.
