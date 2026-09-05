@@ -1042,3 +1042,184 @@ Phase 6 is IPC: two processes exchanging messages over an endpoint, with the
 `Waiting` edge flipping between them in the graph as they rendezvous. It carries
 the last performance gate, and it is the last point at which the representation
 could still change without rewriting userspace.
+
+---
+
+## Entry 7 — Phase 6: two programs that share nothing and still talk
+
+**Milestone: a conversation between two processes, one of which cannot print
+until the other hands it the ability to.**
+
+### The concepts
+
+**IPC** — inter-process communication. Two programs are isolated by design;
+sooner or later they need to cooperate. Everything above the kernel in a
+capability system is built out of this, so it is the operation that matters
+most.
+
+**Synchronous rendezvous.** Two designs are possible.
+
+*Asynchronous:* the sender drops a message in a queue and carries on. Needs
+buffers, needs a policy for a full queue, and — the reason Bramble does not do
+it — a capability sent this way sits *inside a kernel object* while in flight,
+somewhere the ownership tree cannot see it.
+
+*Synchronous:* the sender waits until a receiver is there. The message never
+exists in a queue; it passes directly from one thread to the other. This is what
+seL4 does, and Bramble follows it. `DESIGN.md` settled this in the assumptions
+before any code was written, and the reason was exactly the capability-in-flight
+problem.
+
+The consequence is pleasing. An **endpoint** has no state of its own at all.
+Its entire content is its list of waiting threads — the `Waiting` edges pointing
+at it. The whole rendezvous is: look at the head of that list, copy sixty-four
+bytes, move one edge to the run queue.
+
+**Capability transfer.** A message can carry a capability. The receiver gets a
+*new* edge to the same object; the sender keeps what it had. Rights can only
+narrow, because they are masked by what the sender held at the moment it called.
+
+### How programs normally find each other
+
+By name, in a shared global namespace. A Unix socket at `/tmp/something`, a
+port number, a D-Bus name. Anyone who can name it can try to connect, and
+whether they are allowed to is a separate question answered by a separate
+mechanism — file permissions, a firewall, a policy file.
+
+The name is the connection, and the name is public. Which means "who can talk
+to this service?" is not a property of the service; it is a property of a
+permissions system somewhere else, which someone has to configure correctly.
+
+### What Bramble does
+
+There is no namespace. Two processes can communicate iff each holds a capability
+to the same endpoint, and there is no way to obtain one except to be given it.
+
+The demonstration is the ponger. It is spawned holding exactly two capabilities:
+one endpoint it may receive on, one it may send on. **It has no console.** It
+cannot print, and it cannot acquire the ability to print, because printing means
+holding a capability to the console device and it has none and no way to name
+one.
+
+Then the pinger sends it one:
+
+```
+[pinger] sent the ponger a capability to my console
+[ponger] I could not print until this arrived
+[ponger] received a console capability in slot 3, first word 0xc0ffee
+```
+
+That second line is the point of the whole design. The ponger's ability to
+affect the outside world arrived *in a message*, at runtime, from a program that
+chose to give it. It was not configured, not inherited, not looked up.
+
+And sending a capability needs `Grant` **on the endpoint**, which is a separate
+right from `Send`. Being allowed to talk to someone is not the same as being
+allowed to hand them authority. In Unix those are not distinguishable, because
+authority is not a thing you hold.
+
+### Watching the conversation from outside
+
+Because a wait is an edge in the same graph as everything else, a third thread
+can watch two processes talking:
+
+```
+ipc: watched from outside: 62 of 62 samples caught a thread parked on an endpoint
+```
+
+Every one of those samples is a moment where one process was blocked on an
+endpoint, visible in the same structure that holds processes, memory and
+capabilities. In a conventional kernel this is a wait queue inside the IPC
+subsystem, and nothing outside that subsystem can see it — which is why
+"which processes are waiting on each other?" is not a question you can ask, and
+why deadlock detection is a special-purpose tool rather than a graph query.
+
+### The performance gate, and what the number actually means
+
+This phase carried the last of the three gates. Measured in a release build:
+
+| Measurement | Cycles |
+|---|---|
+| Round trip (4 system calls, 2 rendezvous, several context switches) | 155210 |
+| Two null system calls | 1435 |
+| Graph work per rendezvous | 7081 |
+| — finding the waiter | 1270 |
+| — copying the message | 767 |
+| — requeueing the partner | 5131 |
+| **Graph work as a share of the conversation** | **8%** |
+
+Against a gate of 15%. But it is worth being precise about what 8% is: an
+**upper bound on the graph's cost, not a measure of it**. Any kernel doing this
+rendezvous has to find a waiter, copy a message and requeue a partner. What the
+graph *adds* is the difference between doing that with typed edges and doing it
+with two raw pointers, and that is smaller than 8%.
+
+It started at 13%, and two changes closed the gap. Both were the same shape as
+phase 4's, and both are worth naming because they are the general lesson:
+
+- **Validating twice.** Every multi-step operation calls `precheck_link` so that
+  a failure cannot half-apply, and then calls `link_raw`, which validates the
+  same three things again. Splitting the linking half out for callers that have
+  just prechecked removed an entire duplicate pass.
+- **Re-deriving what is already known.** When an edge is removed, the code did
+  per-kind bookkeeping that re-checked what kind of node each endpoint was. But
+  the *edge kind already fixes that* — invariant I3 says a `Waiting` edge runs
+  from a thread, and the checker verifies it. Asking again cost a node lookup
+  every time.
+
+Together those took a rendezvous from 9602 cycles to 7081, and improved the
+phase 4 context switch from 4953 to 4101 as a side effect.
+
+The pattern across three phases now: **the graph is not slow, but it is easy to
+make it do the same work several times.** Every performance fix so far has been
+removing repetition, not removing structure.
+
+### The bug: a global where a per-thread slot was needed
+
+When a program makes a system call, the kernel arrives with the *user's* stack
+pointer in `rsp` and has to stash it somewhere before switching to its own
+stack. Bramble's stub parked it in a global variable.
+
+That is fine for a system call that returns promptly. It is wrong for one that
+**blocks**. `send` on an empty endpoint blocks; another thread runs; that thread
+finishes its own system call and returns to ring 3 by loading the user stack
+pointer from — the global, which now holds the *other* process's value.
+
+The symptom was a message arriving with a value from one step earlier, and it
+moved when unrelated code was added, which is the signature of state shared where
+it should not be. I spent several rounds chasing it as a compiler problem before
+looking at the stub.
+
+The fix is what real kernels do: the user's stack pointer goes on the
+**per-thread kernel stack** with the rest of the saved frame. The global now
+holds a value for exactly two instructions, with interrupts masked, before it is
+pushed somewhere thread-private.
+
+The general shape is worth keeping: *any* per-CPU or global scratch in a system
+call path is a bug waiting for the first call that blocks. This is the same
+lesson as phase 5's register-preservation bug — both were "the kernel assumed
+its call frame was simpler than it is".
+
+### And a bug in the measuring, not the measured
+
+The first numbers were nonsense: 2.7 million cycles per round trip. Two reasons,
+both my fault, both instructive.
+
+The watching thread shares the run queue with the two processes being timed. It
+was walking the whole edge set on every scheduling round — so its measurement
+work landed *inside* the round-trip time it was measuring. It now checks an
+atomic counter every round and samples the graph rarely.
+
+And the first figures came from a debug build, where a context switch costs
+88693 cycles against release's 4101. A twenty-fold difference, in numbers being
+used to make an architectural decision. **Read the profile before reading the
+number.**
+
+---
+
+## What is next
+
+Phase 7 moves process creation out of the kernel: a first user program that
+spawns others, hands them capabilities, kills one, and watches its partner's
+next message fail cleanly rather than deadlock. Then phase 8 is v1 — the
+inspect syscall and the tools that draw the whole system from a snapshot.
