@@ -360,8 +360,16 @@ pub fn list_remove(edges: &mut EdgeSlab, head: u32, e: u32, dir: Dir) -> u32 {
     }
 }
 
-/// Move `e` to the tail of its list. This is `yield`: two splices, no allocation.
+/// Move `e` to the tail of its list.
+///
+/// For the head of a circular list this is just advancing the head pointer, and
+/// that case is the scheduler's round robin, so it is worth not going the long
+/// way round: the general path does about ten writes to reach a state one write
+/// already describes.
 pub fn list_move_to_tail(edges: &mut EdgeSlab, head: u32, e: u32, dir: Dir) -> u32 {
+    if e == head {
+        return edges.at(head).next(dir);
+    }
     let h = list_remove(edges, head, e, dir);
     list_push_tail(edges, h, e, dir)
 }

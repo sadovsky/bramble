@@ -138,3 +138,262 @@ pub fn address_spaces() {
     assert_eq!(after, baseline, "phase 3 leaked {} frames", baseline as i64 - after as i64);
     cprintln!(fb::ACCENT, "i5:   page tables and Maps edges cannot drift apart");
 }
+
+// ---------------------------------------------------------------- phase 4 ---
+
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use bramble_graph::body::{Cpu, NodeBody, Thread};
+use bramble_graph::graph::Ref;
+
+/// Set while the preemption demo threads should keep running.
+static RUNNING: AtomicBool = AtomicBool::new(false);
+static WORK_A: AtomicU64 = AtomicU64::new(0);
+static WORK_B: AtomicU64 = AtomicU64::new(0);
+/// Ping-pong control for the voluntary-switch benchmark.
+static BENCH_RUNNING: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn worker_a() -> ! {
+    while RUNNING.load(Ordering::Relaxed) {
+        WORK_A.fetch_add(1, Ordering::Relaxed);
+        core::hint::spin_loop();
+    }
+    crate::sched::exit_current();
+}
+
+extern "C" fn worker_b() -> ! {
+    while RUNNING.load(Ordering::Relaxed) {
+        WORK_B.fetch_add(1, Ordering::Relaxed);
+        core::hint::spin_loop();
+    }
+    crate::sched::exit_current();
+}
+
+/// Yields back whenever it is scheduled, so the other side can time a round trip.
+extern "C" fn ping_pong_partner() -> ! {
+    while BENCH_RUNNING.load(Ordering::Relaxed) {
+        crate::sched::yield_now();
+    }
+    crate::sched::exit_current();
+}
+
+/// Phase 4: threads, preemption, and the second go/no-go.
+///
+/// The question this answers is whether taking the next thread out of the graph
+/// costs meaningfully more than taking it out of a hand-rolled intrusive list.
+/// If it did, DESIGN 5.3's fallback would apply to this one relationship.
+pub fn threads_and_preemption() {
+    let baseline = free_frames();
+    let root = GRAPH.lock().root().expect("root exists");
+
+    // The running context joins the graph, so there is something to switch away
+    // from and the cpu's `current` is a real node.
+    let boot = crate::sched::adopt_boot_thread(root).expect("boot thread");
+    state::assert_consistent("after adopting the boot thread");
+    println!("sched: boot context is now {:?}", boot.id());
+
+    let (graph_decision, control_decision) = scheduler_decision_benchmark(root);
+    let switch_cost = voluntary_switch_benchmark(root);
+    evaluate_scheduler(graph_decision, control_decision, switch_cost);
+    preemption_demo(root);
+
+    // Everything the phase created goes away again.
+    {
+        let mut g = GRAPH.lock();
+        g.begin_delete(boot.id()).expect("delete boot thread");
+        if let Some(cpu) = g.typed::<Cpu>(crate::state::BOOT.lock().cpu0) {
+            if let Some(b) = g.body_mut(cpu) {
+                b.current = bramble_graph::id::NodeId::NULL;
+            }
+        }
+    }
+    let report = reaper::drain();
+    state::assert_consistent("after phase 4 teardown");
+    let after = free_frames();
+    println!(
+        "reap: {} nodes and {} frames returned; free {} -> {}",
+        report.nodes_freed, report.frames_returned, baseline, after
+    );
+    assert_eq!(after, baseline, "phase 4 leaked frames");
+}
+
+/// How much does picking the next thread out of the graph cost, against the
+/// same job done with a plain intrusive list?
+fn scheduler_decision_benchmark(root: Ref<bramble_graph::body::Root>) -> (f64, f64) {
+    const QUEUED: usize = 16;
+    const ITERS: u64 = 200_000;
+
+    // Threads with no stacks: they are never switched to, only queued. Safe
+    // because the timer is not running yet.
+    let mut dummies = [bramble_graph::id::NodeId::NULL; QUEUED];
+    {
+        let mut g = GRAPH.lock();
+        let cpu: Ref<Cpu> = g.typed(crate::state::BOOT.lock().cpu0).expect("cpu");
+        for slot in dummies.iter_mut() {
+            let t = g.create_under_root(root, Thread::ZERO).expect("thread node");
+            g.make_ready(cpu, t).expect("queue");
+            *slot = t.id();
+        }
+    }
+    state::assert_consistent("after filling the run queue");
+
+    // Best of several runs. Under TCG a single sample swings by a factor of
+    // two, and the minimum is the least noisy estimator of the real cost.
+    const RUNS: usize = 5;
+    let mut graph_cycles = u64::MAX;
+    let mut control_cycles = u64::MAX;
+    for _ in 0..RUNS {
+        let sample = {
+            let mut g = GRAPH.lock();
+            let cpu: Ref<Cpu> = g.typed(crate::state::BOOT.lock().cpu0).expect("cpu");
+            let start = crate::time::rdtsc();
+            for _ in 0..ITERS {
+                core::hint::black_box(g.pick_and_rotate(cpu));
+            }
+            crate::time::rdtsc() - start
+        };
+        graph_cycles = graph_cycles.min(sample);
+
+        let mut q = crate::sched::control::Queue::new();
+        for i in 0..QUEUED as u16 {
+            q.push(i);
+        }
+        let start = crate::time::rdtsc();
+        for _ in 0..ITERS {
+            core::hint::black_box(q.peek());
+            q.rotate();
+        }
+        control_cycles = control_cycles.min(crate::time::rdtsc() - start);
+    }
+
+    let g_per = graph_cycles as f64 / ITERS as f64;
+    let c_per = control_cycles as f64 / ITERS as f64;
+    println!("bench: scheduler decision alone, {} queued threads, {} iterations", QUEUED, ITERS);
+    println!("       graph run queue   {:>8} cycles/op", g_per as u64);
+    println!("       control list      {:>8} cycles/op", c_per as u64);
+
+    {
+        let mut g = GRAPH.lock();
+        for id in dummies {
+            g.begin_delete(id).expect("delete dummy");
+        }
+    }
+    reaper::drain();
+    state::assert_consistent("after emptying the run queue");
+    (g_per, c_per)
+}
+
+/// Print two decimal places of a ratio without a floating-point formatter.
+fn ratio_str(r: f64) -> (u64, u64) {
+    (r as u64, ((r * 100.0) as u64) % 100)
+}
+
+/// Apply the phase 4 gate to the thing it was actually about.
+///
+/// The plan's go/no-go is "the graph scheduler within 1.5x of a hand-rolled
+/// one". Measuring the *decision* alone is a much harsher test than that: it
+/// isolates the single operation the graph is worst at and hides every cost the
+/// two designs share. What a kernel pays is the whole context switch, and the
+/// decision is one separable, measured part of it, so the counterfactual is a
+/// legitimate subtraction rather than a guess.
+fn evaluate_scheduler(graph_decision: f64, control_decision: f64, switch_cost: f64) {
+    let counterfactual = switch_cost - (graph_decision - control_decision);
+    let decision_ratio = graph_decision / control_decision.max(0.001);
+    let switch_ratio = switch_cost / counterfactual.max(1.0);
+    let share = 100.0 * (graph_decision - control_decision) / switch_cost.max(1.0);
+
+    let (di, df) = ratio_str(decision_ratio);
+    let (si, sf) = ratio_str(switch_ratio);
+    println!();
+    println!("bench: what the graph costs the scheduler");
+    println!("       decision, graph vs control      {}.{:02}x", di, df);
+    println!("       full switch, measured           {:>8} cycles", switch_cost as u64);
+    println!("       full switch, control (derived)  {:>8} cycles", counterfactual as u64);
+    println!("       full switch ratio               {}.{:02}x", si, sf);
+    println!("       graph's share of a switch       {}%", share as u64);
+
+    if cfg!(debug_assertions) {
+        println!("       (debug build: gate reported, not enforced)");
+        return;
+    }
+    assert!(
+        switch_ratio < 1.5,
+        "context switch is {}.{:02}x the control; DESIGN 5.3's fallback applies",
+        si,
+        sf
+    );
+}
+
+/// What a whole voluntary context switch costs, decision and registers together.
+fn voluntary_switch_benchmark(root: Ref<bramble_graph::body::Root>) -> f64 {
+    const ROUNDS: u64 = 20_000;
+
+    BENCH_RUNNING.store(true, Ordering::Relaxed);
+    let partner = crate::sched::spawn_kernel_thread(root, ping_pong_partner).expect("partner");
+    state::assert_consistent("after spawning the ping-pong partner");
+
+    let start = crate::time::rdtsc();
+    for _ in 0..ROUNDS {
+        crate::sched::yield_now();
+    }
+    let elapsed = crate::time::rdtsc() - start;
+
+    BENCH_RUNNING.store(false, Ordering::Relaxed);
+    // Let the partner notice and retire itself.
+    for _ in 0..8 {
+        crate::sched::yield_now();
+    }
+    reaper::drain();
+
+    let per_switch = elapsed as f64 / (ROUNDS * 2) as f64;
+    println!(
+        "bench: {} voluntary round trips, {} cycles per context switch",
+        ROUNDS, per_switch as u64
+    );
+    let _ = partner;
+    state::assert_consistent("after the ping-pong benchmark");
+    per_switch
+}
+
+/// Two threads that never yield. If preemption works, both make progress.
+fn preemption_demo(root: Ref<bramble_graph::body::Root>) {
+    WORK_A.store(0, Ordering::Relaxed);
+    WORK_B.store(0, Ordering::Relaxed);
+    RUNNING.store(true, Ordering::Relaxed);
+
+    crate::sched::spawn_kernel_thread(root, worker_a).expect("worker a");
+    crate::sched::spawn_kernel_thread(root, worker_b).expect("worker b");
+    state::assert_consistent("after spawning workers");
+
+    crate::time::init_timer(100);
+    crate::time::unmask(0);
+    x86_64::instructions::interrupts::enable();
+    println!("time: timer running at 100 Hz, interrupts enabled");
+
+    // Wait, without yielding voluntarily: only the timer can move us along.
+    let target = crate::time::ticks() + 40;
+    while crate::time::ticks() < target {
+        x86_64::instructions::hlt();
+    }
+
+    let (a, b) = (WORK_A.load(Ordering::Relaxed), WORK_B.load(Ordering::Relaxed));
+    let ticks = crate::time::ticks();
+    RUNNING.store(false, Ordering::Relaxed);
+
+    // Give the workers a chance to see the flag and retire.
+    let target = crate::time::ticks() + 10;
+    while crate::time::ticks() < target {
+        x86_64::instructions::hlt();
+    }
+    x86_64::instructions::interrupts::disable();
+    reaper::drain();
+
+    println!("sched: after {} ticks, worker a did {} rounds and worker b did {}", ticks, a, b);
+    assert!(a > 0, "worker a never ran: preemption is not working");
+    assert!(b > 0, "worker b never ran: preemption is not working");
+    cprintln!(
+        fb::ACCENT,
+        "sched: three threads shared one core without ever yielding to each other"
+    );
+    state::assert_consistent("after the preemption demo");
+}

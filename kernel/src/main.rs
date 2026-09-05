@@ -16,10 +16,12 @@ mod frames;
 mod paging;
 mod print;
 mod reaper;
+mod sched;
 mod selftest;
 mod serial;
 mod state;
 mod sync;
+mod time;
 mod vm;
 
 use limine::request::{
@@ -259,8 +261,15 @@ extern "C" fn kmain() -> ! {
     println!();
     dump::dump_graph();
 
+    // ---- phase 4: threads and preemption ----
     println!();
-    cprintln!(fb::ACCENT, "phase 3 complete. halting.");
+    cpu::init_interrupt_controller();
+    selftest::threads_and_preemption();
+    println!();
+    dump::dump_graph();
+
+    println!();
+    cprintln!(fb::ACCENT, "phase 4 complete. halting.");
     halt_forever();
 }
 

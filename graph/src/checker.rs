@@ -243,7 +243,7 @@ impl Checker {
 
             // Follow the chain to the root; the tree has no cycles.
             let mut cur = actual;
-            let mut budget = MAX_PROCESSES + MAX_THREADS + MAX_MEMOBJS + 8;
+            let mut budget = MAX_PROCESSES + MAX_THREADS + MAX_MEMOBJS + MAX_SPACES + 8;
             loop {
                 if Some(cur) == root {
                     break;

@@ -352,6 +352,18 @@ impl Graph {
         self.create_owned(owner.id, body)
     }
 
+    /// Create a node owned by a thread: its kernel stack, and nothing else.
+    pub fn create_under_thread<B: ThreadOwnable>(
+        &mut self,
+        owner: Ref<Thread>,
+        body: B,
+    ) -> Result<Ref<B>>
+    where
+        Self: Store<B>,
+    {
+        self.create_owned(owner.id, body)
+    }
+
     fn create_owned<B: NodeBody>(&mut self, owner: NodeId, body: B) -> Result<Ref<B>>
     where
         Self: Store<B>,
@@ -825,7 +837,8 @@ impl Graph {
         Some(Ref::from_raw(dst))
     }
 
-    /// Round robin: move the queue head to the tail. Two splices, no allocation.
+    /// Round robin: move the queue head to the tail. In a circular list that is
+    /// one pointer move.
     pub fn rotate_ready(&mut self, cpu: Ref<Cpu>) -> bool {
         let head = match self.header(cpu.id) {
             Some(h) => h.head(Dir::Out, EdgeKind::Ready),
@@ -838,6 +851,28 @@ impl Graph {
         self.header_mut(cpu.id).unwrap().set_head(Dir::Out, EdgeKind::Ready, new);
         self.seq += 1;
         true
+    }
+
+    /// The scheduler's whole decision in one call: read the queue head and
+    /// advance it.
+    ///
+    /// `pick_next` followed by `rotate_ready` does the same thing, but looks the
+    /// cpu up three times over. Exposing the operation the caller actually
+    /// performs, rather than making it assemble one out of primitives, is worth
+    /// roughly a third of the cost on the hottest path in the kernel.
+    pub fn pick_and_rotate(&mut self, cpu: Ref<Cpu>) -> Option<Ref<Thread>> {
+        let hdr = self.header_mut(cpu.id)?;
+        let head = hdr.head(Dir::Out, EdgeKind::Ready);
+        if head == 0 {
+            return None;
+        }
+        let edge = self.edges.at(head);
+        let chosen = edge.dst;
+        let next = edge.out_next;
+        // SAFETY of the unwrap: the header was just resolved above.
+        self.header_mut(cpu.id).unwrap().set_head(Dir::Out, EdgeKind::Ready, next);
+        self.seq += 1;
+        Some(Ref::from_raw(chosen))
     }
 
     /// The first thread waiting on an object in the given role, or none.

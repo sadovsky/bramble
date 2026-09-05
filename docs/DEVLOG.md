@@ -604,3 +604,203 @@ keeping it visible in the picture.
 
 It is also the first phase where the kernel does more than one thing at a time,
 which means the locking discipline written down in Entry 2 stops being theory.
+
+---
+
+## Entry 5 — Phase 4: doing more than one thing at once, and the moment of truth
+
+**Milestone: three threads sharing one core, and a measurement that decides
+whether the whole idea is viable.**
+
+This is the phase the plan was ordered around. Everything so far could have been
+thrown away cheaply. From here on, if the design is too slow, we find out having
+built five phases on it.
+
+### The concepts
+
+**A thread** is one flow of execution: a place in the code plus a stack. A
+single processor core can only run one at a time, so the illusion of several is
+made by switching between them fast enough that nobody notices.
+
+**A stack** is scratch memory a running function uses for its local variables
+and for remembering where to return to. Every thread needs its own, because that
+memory *is* the thread's position in its work.
+
+**A context switch** is the act of swapping one thread for another:
+
+1. Save the outgoing thread's registers onto its stack.
+2. Write down where its stack pointer ended up.
+3. Point the stack pointer at the incoming thread's stack.
+4. Restore its registers from there.
+5. Return — and because the stack changed, you return into different code.
+
+It is genuinely eerie the first time: one function is entered by one thread and
+left by another. Bramble's is 17 instructions.
+
+**Preemption.** Two ways a thread stops running. It can **yield** — politely
+hand over. Or it can be **preempted** — interrupted mid-instruction by a timer
+and switched away without consenting. Preemption is what stops one buggy program
+from freezing the machine, and it is the difference between cooperative
+multitasking (Windows 3.1, classic Mac OS) and every serious system since.
+
+**The timer.** A chip that raises an interrupt at a fixed rate — here 100 times
+a second. The handler does three things and no more: count the tick, tell the
+interrupt controller it is handled, then possibly switch. Doing anything slow in
+there stalls the entire machine.
+
+**Why the flags register matters.** A subtle one. Whether interrupts are enabled
+lives in a register called RFLAGS. If a thread yields with interrupts off and we
+switch to a thread that was suspended with them on, and the switch does not
+carry RFLAGS across, the second thread resumes with interrupts disabled — and is
+never preempted again. Bramble's switch saves and restores the flags, so this
+cannot happen. A newly created thread gets a hand-built stack with the flags
+value already set to "interrupts on", which is a pleasing way to make a thread
+start correctly by construction rather than by remembering.
+
+### How it is normally done
+
+A run queue: a linked list of threads. Take the front one, run it, put it at the
+back. Every kernel has one, usually several with priorities. Linux's has been
+rewritten roughly every decade.
+
+The list is **intrusive** — the "next" and "previous" pointers live *inside* the
+thread structure rather than in separate list cells. So queueing a thread
+allocates nothing, and pick-next is one memory read.
+
+### What Bramble does
+
+The same thing, described differently. The run queue **is** the `Ready` arrow
+list of the CPU node. Picking the next thread is reading the head of that list.
+
+The design was explicit that this had to be true: `DESIGN.md` pushed back on the
+original idea that "scheduling is traversal over the runnable subgraph", because
+searching for the next thread would be fatal. A run queue is already a graph —
+what makes it fast is that it is an *ordered adjacency list* with instant access
+to both ends. Bramble keeps the graph and keeps that property.
+
+### The moment of truth, and a measurement that was asking the wrong question
+
+The plan set a gate: **the graph scheduler must be within 1.5x of a hand-rolled
+one**, with a pre-agreed fallback if not. So the kernel contains a control — a
+plain intrusive list, the conventional implementation — and measures both.
+
+The first result:
+
+```
+graph run queue        526 cycles/op
+control list            27 cycles/op
+ratio             19.26x
+```
+
+Nineteen times slower. The kernel panicked on its own gate, exactly as designed.
+
+But that measurement was answering the wrong question. It timed the *decision
+alone*: the one operation where the graph is at its worst, with every cost the
+two designs share excluded. No kernel pays for a scheduling decision in
+isolation. It pays for a whole context switch — saving registers, swapping
+stacks, restoring — and the decision is a small part of that.
+
+So the phase now measures both, and gates on the second:
+
+| Measurement | Value |
+|---|---|
+| Decision, graph | 179 cycles |
+| Decision, control list | 26 cycles |
+| Decision ratio | 6.78x |
+| **Full context switch, measured** | **4678 cycles** |
+| Full context switch with a control queue (derived) | 4525 cycles |
+| **Full switch ratio** | **1.03x** |
+| The graph's share of a context switch | **3%** |
+
+The counterfactual is a subtraction rather than a second implementation, and
+that is worth naming: the decision is a measured, separable, serial part of the
+switch, so removing its excess cost is legitimate arithmetic — but it is derived,
+not observed, and the log should say so.
+
+**The honest summary: the graph is genuinely about seven times slower at
+choosing the next thread, and it does not matter, because choosing is 3% of
+switching.** That is the shape the design predicted, and it is the shape that
+makes the whole project viable. If the number had been 30%, the fallback would
+have applied.
+
+### The part where measuring made the code better
+
+Nineteen times was suspicious even for a graph. Looking properly, the round-robin
+step was calling a general helper meaning "take this arrow out of the list and
+put it at the back". For the *front* of a **circular** list, that is just moving
+the head pointer along one — the arrow is already in the right place. The general
+path was doing about ten memory writes to reach a state one write describes.
+
+Fixing that, plus adding a combined operation so the scheduler looks the CPU up
+once instead of three times, took the decision from 349 to 179 cycles and the
+graph's share of a switch from 7% to 3%.
+
+Neither change gives anything up. The first was a missing special case. The
+second is a small principle worth stating: **a data structure should expose the
+operation its caller actually performs**, not make the caller assemble one out of
+primitives and pay for the seams.
+
+### The bug the checker could not catch
+
+Twelve frames leaked — 48 KiB. Exactly three thread stacks.
+
+The checker found nothing, and was right not to. Every invariant held. Every
+arrow's endpoints existed, ownership was a proper tree, every cache matched.
+**The bookkeeping was perfectly coherent and still wrong**, because
+`spawn_kernel_thread` hung each stack off the root rather than off the thread
+that used it. Nothing was inconsistent. Something was merely untrue.
+
+This is worth dwelling on, because it marks the limit of what a checker buys
+you. Invariants verify that the structure says what it means to say. They cannot
+verify that it says the right thing. A stack owned by the root is a perfectly
+legal graph; it just describes a world where stacks outlive their threads, which
+is not the world we are in.
+
+What caught it was the *other* kind of test: count the free frames before,
+count them after, demand they match. Cheap, dumb, and it found what the clever
+machinery could not.
+
+The fix was to make the graph able to say the true thing. `Owns` now permits a
+thread to own memory, and a thread's stack hangs off the thread. Because
+ownership means "dies with", the reaper hands the frames back automatically — no
+special case, no cleanup code. The right shape made the behaviour fall out.
+
+That is the argument for the ownership tree in miniature: it is not that
+reclamation is clever, it is that once lifetimes are stated correctly there is
+nothing left to get wrong.
+
+### What preemption actually looked like
+
+Two worker threads counting in tight loops, never yielding, plus the boot thread
+waiting. If preemption did not work, the first worker would get the CPU and hold
+it forever.
+
+```
+sched: after 45 ticks, worker a did 857973 rounds and worker b did 859683
+```
+
+Within 0.2% of each other, and neither ever asked to be interrupted. That is the
+timer taking the CPU away 100 times a second and the graph deciding who gets it
+next.
+
+### A deviation worth recording
+
+The design calls for the modern per-core timer (the local APIC), calibrated
+against the old one. Bramble uses the 1981 chips — the 8259 interrupt controller
+and the 8253 timer — directly. Fifty lines instead of three hundred, and on a
+single core they do the same job.
+
+This is a genuine debt, not a shortcut without cost: the 8259 does not scale past
+one core, so it must be replaced when SMP arrives. It is written down in the plan
+as such. The general rule being followed: take the simpler thing when it is
+equivalent *today*, and write down what it will cost tomorrow.
+
+---
+
+## What is next
+
+Phase 5 is userspace: the first code that runs without permission to do whatever
+it likes. That means the CPU's privilege levels, the system call instruction, and
+the first real use of the capability system — a program that can print only
+because it holds an arrow saying it may, and that fails cleanly when the arrow is
+taken away.

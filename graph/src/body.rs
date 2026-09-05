@@ -305,6 +305,10 @@ impl ProcessOwnable for AddressSpace {}
 impl ProcessOwnable for MemoryObject {}
 impl ProcessOwnable for Endpoint {}
 
+/// May be owned by a `Thread`. Only its own stack, in v1.
+pub trait ThreadOwnable: NodeBody {}
+impl ThreadOwnable for MemoryObject {}
+
 /// May be owned by `Root` (that is: anything except another root).
 pub trait RootOwnable: NodeBody {}
 impl RootOwnable for Cpu {}

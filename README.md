@@ -25,8 +25,9 @@ Start here:
 | 1 | The graph crate, host-tested and benchmarked | done |
 | 2 | Frame allocator and the boot graph, inspectable | done |
 | 3 | Address spaces, and page tables proven to match the graph | done |
-| 4 | Threads and preemption | next |
-| 5-8 | Userspace, IPC, lifecycle, v1 | planned |
+| 4 | Threads, preemption, and the fast-path gate | done |
+| 5 | Userspace: ring 3, processes, capabilities | next |
+| 6-8 | IPC, lifecycle, v1 | planned |
 
 ```
 cargo ktest             # graph crate tests, on the host

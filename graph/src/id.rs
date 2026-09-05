@@ -109,6 +109,10 @@ pub const fn compatible(kind: EdgeKind, src: NodeKind, dst: NodeKind) -> bool {
             Process,
             Process | Thread | AddressSpace | MemoryObject | Endpoint,
         ) => true,
+        // A thread owns its kernel stack. Ownership means "dies with", and a
+        // kernel stack dies with its thread; without this the stack outlives
+        // the thread and leaks, which is exactly what phase 4 measured.
+        (Owns, Thread, MemoryObject) => true,
         (Owns, _, _) => false,
 
         // Capabilities: only processes hold them.

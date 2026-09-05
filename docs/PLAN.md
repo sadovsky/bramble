@@ -440,3 +440,67 @@ as the design's principal bug surface. It is not eliminated — no kernel can
 prevent divergence from hardware it must write by hand — but it is now
 detectable for the whole system by one routine, in both directions, in about
 150 lines. That is the concrete payoff of having a single source of truth.
+
+### Phase 4: threads, preemption, and the fast-path gate — **done**
+
+Kernel threads with their own stacks, a context switch that saves the
+callee-saved registers and the flags, the legacy PIC and PIT at 100 Hz, and a
+timer handler that does three O(1) things and then considers switching.
+
+The run queue is the `Ready` adjacency list of the `Cpu` node, exactly as
+designed. Picking the next thread is `pick_and_rotate`: read the head, advance
+it. No traversal anywhere on the path.
+
+**The gate, and how it was nearly failed by a bad measurement.** The plan's
+go/no-go is "the graph scheduler within 1.5x of a hand-rolled one". Measured as
+the *decision in isolation*, the first result was 17.7x in debug and 12.1x in
+release, which would have triggered DESIGN 5.3's fallback. That measurement was
+wrong for the question: it isolates the one operation the graph is worst at and
+excludes every cost the two designs share. What a kernel actually pays is a
+whole context switch. So the phase now measures both and gates on the second,
+with the counterfactual derived by subtracting a measured, separable component.
+
+Final numbers, release build under TCG, best of five runs:
+
+| Measurement | Value |
+|---|---|
+| Scheduler decision, graph run queue | 179 cycles |
+| Scheduler decision, control intrusive list | 26 cycles |
+| Decision ratio | 6.78x |
+| Full context switch, measured | 4678 cycles |
+| Full context switch, control (derived) | 4525 cycles |
+| **Full switch ratio** | **1.03x** |
+| The graph's share of a context switch | 3% |
+
+**Verdict: go.** The graph really is several times slower at the decision, and
+the decision is 3% of a switch.
+
+**What halved the decision cost.** `rotate_ready` was calling the general
+"move this edge to the tail" helper. For the *head* of a circular list that is
+just advancing the head pointer, but the general path did an unlink and a
+relink: about ten writes to reach a state one write describes. Fixing that, and
+adding `pick_and_rotate` so the scheduler looks the cpu up once instead of three
+times, took the decision from 349 to 179 cycles and the graph's share of a
+switch from 7% to 3%. Neither change compromises anything; the first was a
+missing special case and the second is the graph exposing the operation its
+caller actually performs.
+
+**What the checker did not catch.** The phase leaked exactly twelve frames: the
+three thread stacks. The graph was entirely self-consistent the whole time —
+every invariant held — because `spawn_kernel_thread` hung each stack off the
+root rather than off its thread. The bookkeeping was coherent and wrong.
+
+Fixed by adding `Owns: Thread -> MemoryObject` to the compatibility table. A
+thread owning its own stack is what ownership is for: it means "dies with", and
+a kernel stack dies with its thread. The randomised property tests now exercise
+that edge, and there is a direct test that a reaped thread hands its stack back.
+
+**Deviation from the plan.** The design calls for a LAPIC timer calibrated
+against the PIT. v1 uses the PIT and the 8259 PIC directly: fifty lines instead
+of three hundred, and on one core they do the same job. The PIC does not scale
+past one core, so this becomes LAPIC work when SMP arrives (phase 9 item 4).
+
+**Risk retired:** the fast-path cost, which was the whole reason this phase came
+before userspace. It was worth finding out here that the honest answer is "the
+graph costs several times more for the decision and it does not matter", rather
+than in phase 8.

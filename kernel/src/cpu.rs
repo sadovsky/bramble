@@ -76,6 +76,7 @@ pub fn init() {
         idt.stack_segment_fault.set_handler_fn(stack_segment);
         idt.invalid_tss.set_handler_fn(invalid_tss);
         idt.segment_not_present.set_handler_fn(segment_not_present);
+        idt[crate::time::IRQ_TIMER].set_handler_fn(timer_interrupt);
         // SAFETY: index 0 of the IST is the double-fault stack set up above.
         unsafe {
             idt.double_fault
@@ -85,6 +86,12 @@ pub fn init() {
         idt
     });
     idt.load();
+}
+
+/// Remap the interrupt controller above the exception vectors and mask
+/// everything. Separate from `init` so the IDT can be in place first.
+pub fn init_interrupt_controller() {
+    crate::time::init_pic();
 }
 
 fn dump(name: &str, frame: &InterruptStackFrame, code: Option<u64>) {
@@ -131,6 +138,21 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
     dump("page fault", &frame, Some(code.bits()));
     crate::println!("  cause: {:?}", code);
     crate::halt_forever();
+}
+
+/// The timer. Everything here is O(1) by design: count the tick, acknowledge
+/// the controller, and only then consider switching. An interrupt handler that
+/// did unbounded work under the graph lock would be the end of the locking
+/// discipline (DESIGN 3.8 rule 4).
+extern "x86-interrupt" fn timer_interrupt(_frame: InterruptStackFrame) {
+    crate::time::tick();
+    crate::sched::on_tick();
+    // Acknowledge before switching: the thread we switch to must be able to
+    // receive the next tick.
+    crate::time::eoi(crate::time::IRQ_TIMER);
+    if crate::sched::take_need_resched() {
+        crate::sched::schedule();
+    }
 }
 
 extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) -> ! {

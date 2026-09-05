@@ -466,13 +466,17 @@ fn random_ops(seed: u64, steps: usize, check_every: usize) {
                 }
             }
             3 => {
-                if let Some(p) = rng.pick(&procs) {
-                    if let Ok(m) = g.create_under_process(
-                        p,
-                        MemoryObject { phys_base: rng.next() & !0xFFF, pages: 4, ..MemoryObject::ZERO },
-                    ) {
-                        mems.push(m);
-                    }
+                // Half the time hang the memory off a thread instead of a
+                // process, so the thread-owns-its-stack edge is exercised.
+                let body =
+                    MemoryObject { phys_base: rng.next() & !0xFFF, pages: 4, ..MemoryObject::ZERO };
+                let made = if rng.next() & 1 == 0 {
+                    rng.pick(&threads).and_then(|t| g.create_under_thread(t, body).ok())
+                } else {
+                    rng.pick(&procs).and_then(|p| g.create_under_process(p, body).ok())
+                };
+                if let Some(m) = made {
+                    mems.push(m);
                 }
             }
             4 => {
@@ -791,4 +795,74 @@ fn fast_path_is_independent_of_graph_size() {
     }
     let ratio = large / small.max(0.01);
     assert!(ratio < 3.0, "fast path scaled with graph size: {:.2}x", ratio);
+}
+
+#[test]
+fn a_thread_owns_its_stack_and_takes_it_along() {
+    let mut g = empty();
+    let root = g.create_root().unwrap();
+    let p = g.create_under_root(root, Process::ZERO).unwrap();
+    let base_nodes = g.node_count();
+
+    let t = g.create_under_process(p, Thread::ZERO).unwrap();
+    let stack = g
+        .create_under_thread(t, MemoryObject { phys_base: 0x9000, pages: 4, ..MemoryObject::ZERO })
+        .unwrap();
+    check(&g);
+
+    // Ownership means "dies with". Without this edge the stack outlives the
+    // thread and leaks, which is what the phase 4 frame count caught.
+    g.begin_delete(t.id()).unwrap();
+    let mut reclaimed = Vec::new();
+    loop {
+        match g.reap_step() {
+            ReapStep::Idle => break,
+            ReapStep::Freed { reclaim: Reclaim::Frames { phys, pages, .. }, .. } => {
+                reclaimed.push((phys, pages))
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(reclaimed, [(0x9000u64, 4u32)], "the stack must come back with the thread");
+    assert!(!g.is_live(stack.id()));
+    assert_eq!(g.node_count(), base_nodes);
+    check(&g);
+}
+
+#[test]
+fn pick_and_rotate_matches_doing_it_the_long_way() {
+    let mut a = empty();
+    let mut b = empty();
+    let mut queues = Vec::new();
+    for g in [&mut a, &mut b] {
+        let root = g.create_root().unwrap();
+        let cpu = g.create_under_root(root, Cpu::ZERO).unwrap();
+        let p = g.create_under_root(root, Process::ZERO).unwrap();
+        let ts: Vec<_> = (0..5)
+            .map(|_| {
+                let t = g.create_under_process(p, Thread::ZERO).unwrap();
+                g.make_ready(cpu, t).unwrap();
+                t
+            })
+            .collect();
+        queues.push((cpu, ts));
+    }
+    let (cpu_a, ts_a) = queues[0].clone();
+    let (cpu_b, _) = queues[1].clone();
+
+    // Twelve rounds is more than two full laps of a five-deep queue.
+    for round in 0..12 {
+        let combined = a.pick_and_rotate(cpu_a);
+        let separate = b.pick_next(cpu_b);
+        b.rotate_ready(cpu_b);
+        assert_eq!(
+            combined.map(|r| r.id().idx()),
+            separate.map(|r| r.id().idx()),
+            "round {} disagreed",
+            round
+        );
+        assert_eq!(combined.unwrap().id().idx(), ts_a[round % 5].id().idx());
+        check(&a);
+        check(&b);
+    }
 }
