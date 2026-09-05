@@ -214,13 +214,44 @@ fn load_segments(
     Ok(())
 }
 
+/// Who owns the new process. Ownership decides its lifetime: a process spawned
+/// by another dies with it, which is how a user program can be trusted to clean
+/// up after its children without being trusted to remember to.
+#[derive(Clone, Copy)]
+pub enum Owner {
+    Root(Ref<Root>),
+    Process(Ref<Process>),
+}
+
+/// Put a spawned process on the run queue.
+///
+/// Separate from `spawn` so that a caller can grant capabilities first. A
+/// process that started before its authority arrived would have a window in
+/// which it could do nothing, and would have to be written to cope with it.
+pub fn start(proc: Ref<Process>) -> Result<(), SpawnError> {
+    let mut g = GRAPH.lock();
+    let mut thread = None;
+    for eid in g.out_edges(proc.id(), bramble_graph::id::EdgeKind::Owns) {
+        if let Some(e) = g.edge(eid) {
+            if e.dst.kind() == Some(bramble_graph::id::NodeKind::Thread) {
+                thread = g.typed::<Thread>(e.dst);
+                break;
+            }
+        }
+    }
+    let t = thread.ok_or(VmError::StaleSpace)?;
+    let cpu: Ref<Cpu> = g.typed(crate::state::cpu0()).ok_or(VmError::StaleSpace)?;
+    g.make_ready(cpu, t)?;
+    Ok(())
+}
+
 /// Load an executable and make it runnable.
 ///
 /// `grants` is the process's entire authority: the capabilities it starts with
 /// and, since there is no other way to name anything, the only objects it can
 /// ever reach.
 pub fn spawn(
-    root: Ref<Root>,
+    owner: Owner,
     image: &[u8],
     grants: &[(bramble_graph::id::NodeId, Rights)],
 ) -> Result<Ref<Process>, SpawnError> {
@@ -228,7 +259,10 @@ pub fn spawn(
 
     let proc = {
         let mut g = GRAPH.lock();
-        g.create_under_root(root, Process::ZERO)?
+        match owner {
+            Owner::Root(r) => g.create_under_root(r, Process::ZERO)?,
+            Owner::Process(p) => g.create_under_process(p, Process::ZERO)?,
+        }
     };
     let space = vm::create_space_for(proc)?;
 
@@ -295,8 +329,9 @@ pub fn spawn(
         g.grant_raw(proc, *target, *rights)?;
     }
 
-    let cpu: Ref<Cpu> = g.typed(crate::state::cpu0()).ok_or(VmError::StaleSpace)?;
-    g.make_ready(cpu, thread)?;
+    // Deliberately not started here. The caller grants capabilities first, so
+    // that a program never runs in a window where its authority is incomplete
+    // and it would have to be written to cope with that.
     let _ = abi::R_READ;
     Ok(proc)
 }

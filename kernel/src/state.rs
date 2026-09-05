@@ -190,11 +190,12 @@ pub fn populate(
                 ..MemoryObject::ZERO
             },
         )?;
-        // Name the first few modules; long paths need a post-v1 string table.
-        if i < 4 {
-            let name = short_name(f);
-            let _ = g.link_named(root, m, name);
-        }
+        // Every module gets a name, because a name is the only way a program
+        // can ask for one and there is nothing else in the system that could
+        // hand it over.
+        let _ = i;
+        let name = short_name(f);
+        let _ = g.link_named(root, m, name);
     }
 
     // The kernel's own address space. Its two mappings are recorded as edges

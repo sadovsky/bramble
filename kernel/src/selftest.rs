@@ -10,7 +10,7 @@ use bramble_graph::edge::{MapsAttr, Prot};
 use crate::paging::{self, PTE_PRESENT, PTE_USER, PTE_WRITABLE};
 use crate::state::{self, FRAMES, GRAPH};
 use crate::vm::{self, I5};
-use crate::{cprintln, fb, println, reaper};
+use crate::{cprintln, fb, print, println, reaper};
 
 /// A virtual address well away from anything the kernel uses.
 const TEST_VADDR: u64 = 0x0000_4000_0000;
@@ -221,7 +221,10 @@ pub fn threads_and_preemption() {
 /// same job done with a plain intrusive list?
 fn scheduler_decision_benchmark(root: Ref<bramble_graph::body::Root>) -> (f64, f64) {
     const QUEUED: usize = 16;
-    const ITERS: u64 = 200_000;
+    // A debug kernel runs under emulation at roughly a twentieth of the speed,
+    // and the gate is not enforced there anyway. Measure enough to see the
+    // shape, not enough to make a boot take minutes.
+    const ITERS: u64 = if cfg!(debug_assertions) { 20_000 } else { 200_000 };
 
     // Threads with no stacks: they are never switched to, only queued. Safe
     // because the timer is not running yet.
@@ -239,7 +242,7 @@ fn scheduler_decision_benchmark(root: Ref<bramble_graph::body::Root>) -> (f64, f
 
     // Best of several runs. Under TCG a single sample swings by a factor of
     // two, and the minimum is the least noisy estimator of the real cost.
-    const RUNS: usize = 5;
+    const RUNS: usize = if cfg!(debug_assertions) { 2 } else { 5 };
     let mut graph_cycles = u64::MAX;
     let mut control_cycles = u64::MAX;
     for _ in 0..RUNS {
@@ -326,7 +329,7 @@ fn evaluate_scheduler(graph_decision: f64, control_decision: f64, switch_cost: f
 
 /// What a whole voluntary context switch costs, decision and registers together.
 fn voluntary_switch_benchmark(root: Ref<bramble_graph::body::Root>) -> f64 {
-    const ROUNDS: u64 = 20_000;
+    const ROUNDS: u64 = if cfg!(debug_assertions) { 2_000 } else { 20_000 };
 
     BENCH_RUNNING.store(true, Ordering::Relaxed);
     let partner = crate::sched::spawn_kernel_thread(root, ping_pong_partner).expect("partner");
@@ -464,8 +467,9 @@ pub fn userspace(modules: &[&limine::file::File]) {
         (console, Rights::READ),
         (root_id, Rights::LOOKUP),
     ];
-    let proc = crate::proc::spawn(root, hello, &grants)
+    let proc = crate::proc::spawn(crate::proc::Owner::Root(root), hello, &grants)
         .unwrap_or_else(|e| panic!("could not spawn hello: {}", e.describe()));
+    crate::proc::start(proc).expect("start hello");
     state::assert_consistent("after spawning hello");
     println!("proc: hello is {:?}, running it now", proc.id());
     println!();
@@ -480,8 +484,10 @@ pub fn userspace(modules: &[&limine::file::File]) {
     // Now the same machinery, applied to a program that misbehaves.
     let faulter = find_module(modules, "faulter").expect("the faulter module is missing");
     println!("proc: loading faulter ({} KiB of ELF)", faulter.len() >> 10);
-    let proc = crate::proc::spawn(root, faulter, &[(console, Rights::READ.union(Rights::WRITE))])
-        .unwrap_or_else(|e| panic!("could not spawn faulter: {}", e.describe()));
+    let proc =
+        crate::proc::spawn(crate::proc::Owner::Root(root), faulter, &[(console, Rights::READ.union(Rights::WRITE))])
+            .unwrap_or_else(|e| panic!("could not spawn faulter: {}", e.describe()));
+    crate::proc::start(proc).expect("start faulter");
     println!("proc: faulter loaded");
     state::assert_consistent("after spawning faulter");
     println!();
@@ -569,16 +575,17 @@ pub fn ipc(modules: &[&limine::file::File]) {
     // endpoint it may receive on and one it may send on; everything else it
     // ever does has to arrive in a message.
     let ponger = crate::proc::spawn(
-        root,
+        crate::proc::Owner::Root(root),
         ponger_elf,
         &[(a2b, Rights::RECV), (b2a, Rights::SEND)],
     )
     .unwrap_or_else(|e| panic!("could not spawn ponger: {}", e.describe()));
+    crate::proc::start(ponger).expect("start ponger");
 
     // The pinger may send on a2b *and* hand out capabilities through it, which
     // is a separate right from being allowed to send.
     let pinger = crate::proc::spawn(
-        root,
+        crate::proc::Owner::Root(root),
         pinger_elf,
         &[
             (console, Rights::READ.union(Rights::WRITE)),
@@ -587,6 +594,7 @@ pub fn ipc(modules: &[&limine::file::File]) {
         ],
     )
     .unwrap_or_else(|e| panic!("could not spawn pinger: {}", e.describe()));
+    crate::proc::start(pinger).expect("start pinger");
     state::assert_consistent("after spawning both");
     println!("ipc:  ponger {:?}, pinger {:?}, both running", ponger.id(), pinger.id());
     println!();
@@ -689,4 +697,119 @@ pub fn ipc(modules: &[&limine::file::File]) {
     let after = free_frames();
     assert_eq!(after, baseline, "phase 6 leaked frames");
     cprintln!(fb::ACCENT, "ipc:  two processes shared nothing but two edges");
+}
+
+// ---------------------------------------------------------------- phase 7 ---
+
+/// A census of the graph by kind. Node and edge *identities* change as things
+/// are created and destroyed, but if the system really cleans up after itself
+/// the shape must come back to exactly what it was.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct Census {
+    nodes: [u32; 8],
+    edges: [u32; 7],
+    free_frames: usize,
+}
+
+fn census() -> Census {
+    let g = GRAPH.lock();
+    let mut c = Census::default();
+    for id in g.live_nodes() {
+        if let Some(k) = id.kind() {
+            c.nodes[k as usize] += 1;
+        }
+    }
+    for eid in g.live_edges() {
+        if let Some(k) = g.edge(eid).and_then(|e| e.edge_kind()) {
+            c.edges[k as usize] += 1;
+        }
+    }
+    drop(g);
+    c.free_frames = free_frames();
+    c
+}
+
+fn print_census(label: &str, c: &Census) {
+    print!("{}", label);
+    for (i, n) in c.nodes.iter().enumerate() {
+        if *n > 0 {
+            print!(" {}x{}", n, bramble_abi::NODE_KIND_NAMES[i]);
+        }
+    }
+    for (i, n) in c.edges.iter().enumerate() {
+        if *n > 0 {
+            print!(" {}x{}", n, bramble_abi::EDGE_KIND_NAMES[i]);
+        }
+    }
+    println!(" | {} frames free", c.free_frames);
+}
+
+/// Phase 7: lifecycle from userspace. The kernel starts one program; that
+/// program does everything else.
+pub fn lifecycle(modules: &[&limine::file::File]) {
+    let (root, console, root_id) = {
+        let g = GRAPH.lock();
+        let boot = crate::state::BOOT.lock();
+        (g.root().expect("root"), boot.console, boot.root)
+    };
+    // Census first: the boot thread this phase adopts is scaffolding, and
+    // counting it on one side and not the other would compare two different
+    // things.
+    let before = census();
+    print_census("life: before ", &before);
+    let boot = crate::sched::adopt_boot_thread(root).expect("boot thread");
+
+    let init_elf = find_module(modules, "init").expect("the init module is missing");
+    x86_64::instructions::interrupts::enable();
+
+    // Three capabilities. Everything the system does from here is built out of
+    // them, by a program the kernel has no special knowledge of.
+    let init = crate::proc::spawn(
+        crate::proc::Owner::Root(root),
+        init_elf,
+        &[(console, Rights::READ.union(Rights::WRITE)), (root_id, Rights::LOOKUP)],
+    )
+    .unwrap_or_else(|e| panic!("could not spawn init: {}", e.describe()));
+    crate::proc::start(init).expect("start init");
+    state::assert_consistent("after spawning init");
+    println!("life: init is {:?}, and the kernel now does nothing but reap", init.id());
+
+    // The kernel's only remaining job is to reap. Everything else that happens
+    // from here is init's doing.
+    let deadline = crate::time::ticks() + 6000;
+    let mut rounds = 0u32;
+    while GRAPH.lock().is_live(init.id()) {
+        crate::sched::yield_now();
+        rounds += 1;
+        if rounds.is_multiple_of(32) {
+            reaper::drain();
+            state::assert_consistent("while init was running");
+            assert!(crate::time::ticks() < deadline, "init never finished");
+        }
+    }
+    x86_64::instructions::interrupts::disable();
+    reaper::drain();
+    state::assert_consistent("after init exited");
+
+    {
+        let mut g = GRAPH.lock();
+        g.begin_delete(boot.id()).expect("delete boot thread");
+        if let Some(cpu) = g.typed::<Cpu>(crate::state::cpu0()) {
+            if let Some(b) = g.body_mut(cpu) {
+                b.current = NodeId::NULL;
+            }
+        }
+    }
+    reaper::drain();
+
+    let after = census();
+    print_census("life: after  ", &after);
+    assert_eq!(
+        before, after,
+        "the system did not return to the shape it started in"
+    );
+    cprintln!(
+        fb::ACCENT,
+        "life: a program made processes, endpoints and grants, and left no trace"
+    );
 }

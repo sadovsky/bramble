@@ -17,7 +17,11 @@ const TO_PONGER: u32 = 2;
 /// collected by the process that sent it.
 const FROM_PONGER: u32 = 3;
 
-const ROUNDS: u64 = 2000;
+/// User programs are always built optimised, but they run inside whichever
+/// kernel is under test, and a debug kernel is roughly twenty times slower.
+/// Nothing here can know which, so this is a compromise: long enough to average
+/// over, short enough not to make a debug boot interminable.
+const ROUNDS: u64 = 500;
 
 entry!(main);
 

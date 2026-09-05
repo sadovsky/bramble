@@ -645,3 +645,65 @@ profile before reading the number.
 **Risk retired:** the representation is now committed. This was the last point
 at which `Waiting` could have been demoted to fields without rewriting
 userspace, and it does not need to be.
+
+### Phase 7: lifecycle and naming from userspace — **done**
+
+Five more system calls — `spawn`, `grant`, `start`, `kill`, `endpoint_create` —
+and the kernel stops creating processes. It loads exactly one program, `init`,
+grants it exactly two capabilities (a console and the root with `Lookup`), and
+from then on does nothing but reap.
+
+The authority rules fell out of the ownership tree rather than needing to be
+invented:
+
+- **Spawning needs only `Read` on the image.** The child is *owned by its
+  parent*, so everything it consumes is already charged to the parent's subtree
+  and dies with it. A program cannot outrun its own quota by spawning.
+- **`spawn` and `start` are separate**, so a parent grants capabilities before
+  the child runs. A program never executes in a window where its authority is
+  incomplete and would have to be written to cope with that.
+- **`grant` needs `Grant` on the child**, `start` and `kill` need `Manage`.
+- **`endpoint_create` needs nothing.** An endpoint is owned by its creator and
+  bounded by the creator's own arenas, like allocating memory.
+- **`lookup` grants rights that match the kind**: a device readable and
+  writable, a program image readable only, which is exactly the authority
+  needed to spawn it and no more.
+
+The milestone, run at every boot:
+
+```
+life: before  1xRoot 1xCpu 1xAddressSpace 16xMemoryObject 1xDevice 19xOwns 2xMaps 13xNamed | 116397 frames free
+[init] worker 1 is process slot 5, granted console as 1 and a reply channel as 2
+[worker] made an endpoint of my own in slot 3
+[init] worker 1 sent back a capability to itself in slot 6
+[init] killing worker 1
+[init] after 26 yields, my capability to its endpoint is simply gone
+[init] sending through the revoked capability failed cleanly
+[init] worker 2 is process slot 7 ...
+[init] done; exiting, which is the only cleanup this program does
+life: after   1xRoot 1xCpu 1xAddressSpace 16xMemoryObject 1xDevice 19xOwns 2xMaps 13xNamed | 116397 frames free
+```
+
+The two censuses are compared field by field and the phase fails if they
+differ. They are identical, frame count included, after two processes were
+created, given capabilities, talked to, killed and replaced.
+
+**What the worker demonstrates.** It creates an endpoint *it owns* and sends a
+capability to it back to its parent. That is the whole of service registration
+in a capability system: no name to publish, no registry to publish it in, just a
+capability handed to exactly the party that should have it. And when the worker
+dies, the endpoint dies with it, every capability to it is revoked, and the
+parent's handle slot empties on its own — which init watches happen, and then
+confirms that sending through the dead capability returns an error rather than
+blocking for ever.
+
+**Risk retired:** unbounded work under the lock, and cascading deletion
+ordering. The reaper handled a two-generation subtree with no special cases.
+
+**Small things fixed along the way.** Only the first four boot modules were
+being named, so `lookup("worker")` failed once there were six; all modules are
+named now. `spawn` was still starting the thread it created, which made
+`start` fail with `BadState` — the sort of error the graph's own state machine
+catches rather than letting through. And the benchmarks in phases 4 and 6 now
+scale themselves down in debug builds, where the gates are not enforced anyway
+and a full boot was taking minutes.

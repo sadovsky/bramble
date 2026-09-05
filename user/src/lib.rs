@@ -89,6 +89,38 @@ pub fn recv(ep: u32, words: &mut [u64; abi::MSG_WORDS]) -> i64 {
     unsafe { syscall(abi::SYS_RECV, ep as u64, words.as_mut_ptr() as u64, 0, 0) }
 }
 
+/// Create a process from an image this program can read. It is created but not
+/// started, so its capabilities can be granted first.
+pub fn spawn(image_slot: u32) -> i64 {
+    // SAFETY: no pointer arguments.
+    unsafe { syscall(abi::SYS_SPAWN, image_slot as u64, 0, 0, 0) }
+}
+
+/// Copy one of our capabilities into another process, narrowed by `mask`.
+pub fn grant(process_slot: u32, cap_slot: u32, mask: u32) -> i64 {
+    // SAFETY: no pointer arguments.
+    unsafe {
+        syscall(abi::SYS_GRANT, process_slot as u64, cap_slot as u64, mask as u64, 0)
+    }
+}
+
+pub fn start(process_slot: u32) -> i64 {
+    // SAFETY: no pointer arguments.
+    unsafe { syscall(abi::SYS_START, process_slot as u64, 0, 0, 0) }
+}
+
+/// Destroy a process. Everything it owns goes with it.
+pub fn kill(process_slot: u32) -> i64 {
+    // SAFETY: no pointer arguments.
+    unsafe { syscall(abi::SYS_KILL, process_slot as u64, 0, 0, 0) }
+}
+
+/// Make an endpoint owned by this process.
+pub fn endpoint_create() -> i64 {
+    // SAFETY: no pointer arguments.
+    unsafe { syscall(abi::SYS_ENDPOINT, 0, 0, 0, 0) }
+}
+
 /// The cycle counter. Under emulation this is not real cycles, so only ratios
 /// between measurements taken the same way mean anything.
 #[inline]

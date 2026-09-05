@@ -19,7 +19,7 @@ extern "C" fn main() -> ! {
 
     // SAFETY: none whatsoever. That is the point.
     unsafe {
-        core::ptr::write_volatile(0 as *mut u64, 0xdead);
+        core::ptr::write_volatile(core::ptr::null_mut::<u64>(), 0xdead);
     }
 
     println!("[faulter] FAULT: still running after touching address zero");

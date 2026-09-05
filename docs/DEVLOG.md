@@ -1223,3 +1223,134 @@ Phase 7 moves process creation out of the kernel: a first user program that
 spawns others, hands them capabilities, kills one, and watches its partner's
 next message fail cleanly rather than deadlock. Then phase 8 is v1 — the
 inspect syscall and the tools that draw the whole system from a snapshot.
+
+---
+
+## Entry 8 — Phase 7: the kernel stops being in charge
+
+**Milestone: the kernel loads one program and then does nothing but clean up
+after it.**
+
+### The concept
+
+**init.** Every Unix-like system has one: the first process, started by the
+kernel, which starts everything else. On Linux it is `systemd` or similar. The
+kernel's role in process creation ends after that one.
+
+Bramble's is smaller than usual, because it holds less. It gets two
+capabilities — a console, and the root with `Lookup` — and everything the system
+subsequently does is built out of those two.
+
+### How process creation normally works
+
+`fork()` and `exec()`. `fork` makes a copy of the calling process; `exec`
+replaces its program. The child inherits *everything*: file descriptors, memory
+mappings, the user id, the environment. You then remove what the child should
+not have, by closing descriptors and dropping privileges — carefully, in the
+right order, remembering everything.
+
+That is inheritance by default with subtraction afterwards, and its failure mode
+is the one you would predict: forget a subtraction and the child has authority
+nobody meant it to have. Whole categories of security bug live in exactly that
+gap, which is why `posix_spawn` and `CLOEXEC` and seccomp filters exist — all of
+them ways of getting back to "the child has only what I meant it to have".
+
+### What Bramble does
+
+The child starts with **nothing**, and is given things.
+
+```rust
+let child = spawn(image);                                    // exists, not running
+grant(child, CONSOLE, R_READ | R_WRITE);                     // may print
+grant(child, bootstrap, R_SEND | R_GRANT);                   // may reply to me
+start(child);                                                // now it runs
+```
+
+Three properties fall out, none of which had to be designed:
+
+**Spawn and start are separate.** A child never runs in a window where its
+authority is incomplete, so it does not have to be written to cope with one.
+
+**Spawning needs only the right to read the image.** No special privilege, no
+"may create processes" bit. The reason is the ownership tree: the child is owned
+by its parent, so everything it consumes is already charged to the parent's
+subtree and dies with it. A program cannot escape its own limits by spawning
+helpers, because its helpers are inside it.
+
+**`lookup` grants rights that match what was found.** A device comes back
+readable and writable. A program image comes back **readable only** — exactly
+the authority needed to spawn it and nothing more. Naming a thing does not hand
+over control of it.
+
+### Revocation, watched from the inside
+
+The interesting part is the death.
+
+The worker creates an endpoint *it owns* and sends a capability to it back to
+init. That is service registration in a capability system: no name to publish,
+no registry, just a capability handed to the one party that should have it.
+
+Then init kills the worker. One edge is detached. The worker's process, its
+thread, its address space, its page tables, its memory and **its endpoint** all
+become unreachable and the reaper returns them.
+
+And init can watch it happen:
+
+```
+[init] killing worker 1
+[init] after 26 yields, my capability to its endpoint is simply gone
+[init] sending through the revoked capability failed cleanly
+```
+
+Init does not clean up its own handle. Nothing tells it to. The handle table
+entry is cleared by the same operation that removes the `Holds` edge, because
+the table is a derived index and the edge is the truth. Init observes an empty
+slot where a capability used to be — and then confirms that sending through it
+returns an error rather than blocking forever, which is the difference between a
+revoked capability and a dangling pointer.
+
+In Unix the equivalent is deleting a file that a process still has open. The
+process keeps reading it. The file is gone from the directory but not from the
+process, and there is no mechanism to take it back. Revocation is simply not
+something Unix can express.
+
+### The proof: a census
+
+The phase compares the shape of the entire graph before and after:
+
+```
+life: before  1xRoot 1xCpu 1xAddressSpace 16xMemoryObject 1xDevice 19xOwns 2xMaps 13xNamed | 116397 frames free
+life: after   1xRoot 1xCpu 1xAddressSpace 16xMemoryObject 1xDevice 19xOwns 2xMaps 13xNamed | 116397 frames free
+```
+
+Identical. Two processes were created, granted capabilities, talked to, killed
+and replaced; two endpoints were made and destroyed; a program spawned children
+and exited. Not one node, edge or frame was left behind.
+
+The identities all changed — every node has a new generation number — but the
+*shape* came back exactly. That is what "the system cleaned up after itself"
+looks like when you can state it precisely, and it is a check no conventional
+kernel can write about itself, because there is no single structure whose shape
+you could compare.
+
+### Two small bugs worth the mention
+
+Only the first four boot modules were being given names, from an early decision
+that names were scarce. With six programs, `lookup("worker")` failed. Fixed by
+naming all of them — names are edges, and there was never a reason to ration
+them.
+
+And `spawn` was still starting the thread it created, so the new separate
+`start` failed with `BadState`. Worth noting because of *how* it failed: the
+graph's own state machine refused the transition rather than letting a thread be
+queued twice. The invariant caught a refactoring mistake, which is the cheapest
+possible place to catch one.
+
+---
+
+## What is next
+
+Phase 8 is v1: the final snapshot format, and the host tools that decode it,
+draw the whole system, diff two snapshots, and answer "could this process ever
+reach that object?" — the take-grant question from 1977, asked of a running
+kernel.

@@ -40,7 +40,7 @@ ISO_ROOT=build/iso_root
 rm -rf "$ISO_ROOT" && mkdir -p "$ISO_ROOT/boot/limine" "$ISO_ROOT/EFI/BOOT"
 cp "$KERNEL" "$ISO_ROOT/boot/bramble"
 cp limine.conf "$ISO_ROOT/boot/limine/"
-for program in hello faulter pinger ponger; do
+for program in hello faulter pinger ponger init worker; do
     cp "$USER_DIR/$program" "$ISO_ROOT/boot/$program"
 done
 cp "$LIMINE_DIR/limine-uefi-cd.bin" "$ISO_ROOT/boot/limine/"

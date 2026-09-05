@@ -8,7 +8,7 @@
 //! there is no syntax for it.
 
 use bramble_abi::*;
-use bramble_graph::body::{Device, Process, Rights, Root, Thread};
+use bramble_graph::body::{Device, NodeBody, Process, Rights, Thread};
 use bramble_graph::edge::{EdgeAttr, MapsAttr, NamedAttr, Prot};
 use bramble_graph::graph::Ref;
 use bramble_graph::id::{EdgeKind, NodeKind};
@@ -206,6 +206,11 @@ extern "C" fn dispatch(a0: u64, a1: u64, a2: u64, _a3: u64, nr: u64) -> i64 {
         SYS_RIGHTS => sys_rights(a0),
         SYS_SEND => sys_send(a0, a1, a2),
         SYS_RECV => sys_recv(a0, a1),
+        SYS_SPAWN => sys_spawn(a0),
+        SYS_GRANT => sys_grant(a0, a1, a2),
+        SYS_START => sys_start(a0),
+        SYS_KILL => sys_kill(a0),
+        SYS_ENDPOINT => sys_endpoint(),
         _ => E_BADCALL,
     }
 }
@@ -305,16 +310,19 @@ fn sys_lookup(ptr: u64, len: u64) -> i64 {
 
     // A lookup grants a capability, so it has to say what rights it grants.
     // Read and write only: naming something must not hand over control of it.
-    let rights = Rights::READ.union(Rights::WRITE);
-    let result = match found.kind() {
-        Some(NodeKind::Device) => g.typed::<Device>(found).map(|d| g.grant(proc, d, rights)),
-        Some(NodeKind::Root) => g.typed::<Root>(found).map(|r| g.grant(proc, r, rights)),
-        _ => None,
+    // Naming something must not hand over control of it. A device is readable
+    // and writable; a memory object holding a program image is readable only,
+    // which is exactly the authority needed to spawn it and no more.
+    let rights = match found.kind() {
+        Some(NodeKind::Device) => Rights::READ.union(Rights::WRITE),
+        Some(NodeKind::MemoryObject) => Rights::READ,
+        Some(NodeKind::Endpoint) => Rights::SEND.union(Rights::RECV),
+        _ => Rights::READ,
     };
-    match result {
-        Some(Ok(slot)) => slot as i64,
-        Some(Err(_)) => E_NOSPACE,
-        None => E_NOTFOUND,
+    match g.grant_raw(proc, found, rights) {
+        Ok(slot) => slot as i64,
+        Err(bramble_graph::graph::GraphError::Incompatible { .. }) => E_BADKIND,
+        Err(_) => E_NOSPACE,
     }
 }
 
@@ -329,6 +337,139 @@ fn sys_rights(slot: u64) -> i64 {
     match g.rights_of(proc, slot as u32) {
         Some(r) => r.0 as i64,
         None => E_BADHANDLE,
+    }
+}
+
+/// Resolve a slot that must name a process, with the given right.
+fn resolve_process(
+    proc: Ref<Process>,
+    slot: u64,
+    need: Rights,
+) -> core::result::Result<Ref<Process>, i64> {
+    let g = GRAPH.lock();
+    let id = match g.resolve(proc, slot as u32, need) {
+        Ok(id) => id,
+        Err(bramble_graph::graph::GraphError::MissingRights { .. }) => return Err(E_PERM),
+        Err(_) => return Err(E_BADHANDLE),
+    };
+    if id.kind() != Some(NodeKind::Process) {
+        return Err(E_BADKIND);
+    }
+    g.typed(id).ok_or(E_BADHANDLE)
+}
+
+/// Create a process from an image the caller can read.
+///
+/// The authority to spawn is the authority to read the image, and nothing else
+/// is needed: the new process is *owned by its parent*, so everything it
+/// consumes is already accounted to the parent's subtree and dies with it. A
+/// program that spawns cannot outrun its own quota by proxy.
+fn sys_spawn(image_slot: u64) -> i64 {
+    let parent = match caller() {
+        Some(p) => p,
+        None => return E_BADHANDLE,
+    };
+    let (phys, pages) = {
+        let g = GRAPH.lock();
+        let id = match g.resolve(parent, image_slot as u32, Rights::READ) {
+            Ok(id) => id,
+            Err(bramble_graph::graph::GraphError::MissingRights { .. }) => return E_PERM,
+            Err(_) => return E_BADHANDLE,
+        };
+        if id.kind() != Some(NodeKind::MemoryObject) {
+            return E_BADKIND;
+        }
+        match g.typed::<bramble_graph::body::MemoryObject>(id).and_then(|m| g.body(m)) {
+            Some(b) => (b.phys_base, b.pages),
+            None => return E_BADHANDLE,
+        }
+    };
+    // SAFETY: a memory object the caller holds, reached through the direct map.
+    let image = unsafe {
+        core::slice::from_raw_parts(
+            (crate::paging::hhdm() + phys) as *const u8,
+            pages as usize * 4096,
+        )
+    };
+    let child = match crate::proc::spawn(crate::proc::Owner::Process(parent), image, &[]) {
+        Ok(c) => c,
+        Err(crate::proc::SpawnError::Elf(_)) => return E_BADIMAGE,
+        Err(_) => return E_NOSPACE,
+    };
+    // The parent gets a capability to what it just made, with full rights over
+    // it. That is the only handle to the child in existence.
+    let mut g = GRAPH.lock();
+    match g.grant(parent, child, Rights::ALL) {
+        Ok(slot) => slot as i64,
+        Err(_) => E_NOSPACE,
+    }
+}
+
+/// Copy one of the caller's capabilities into another process, narrowed.
+fn sys_grant(proc_slot: u64, cap_slot: u64, mask: u64) -> i64 {
+    let parent = match caller() {
+        Some(p) => p,
+        None => return E_BADHANDLE,
+    };
+    let child = match resolve_process(parent, proc_slot, Rights::GRANT) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let mut g = GRAPH.lock();
+    match g.copy_cap(parent, cap_slot as u32, child, Rights(mask as u32)) {
+        Ok(slot) => slot as i64,
+        Err(bramble_graph::graph::GraphError::NoFreeSlot) => E_NOSPACE,
+        Err(_) => E_BADHANDLE,
+    }
+}
+
+fn sys_start(proc_slot: u64) -> i64 {
+    let parent = match caller() {
+        Some(p) => p,
+        None => return E_BADHANDLE,
+    };
+    let child = match resolve_process(parent, proc_slot, Rights::MANAGE) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    match crate::proc::start(child) {
+        Ok(()) => 0,
+        Err(_) => E_BADHANDLE,
+    }
+}
+
+/// Destroy a process. One edge is detached; everything it owns follows.
+fn sys_kill(proc_slot: u64) -> i64 {
+    let parent = match caller() {
+        Some(p) => p,
+        None => return E_BADHANDLE,
+    };
+    let child = match resolve_process(parent, proc_slot, Rights::MANAGE) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let mut g = GRAPH.lock();
+    match g.begin_delete(child.id()) {
+        Ok(()) => 0,
+        Err(_) => E_BADHANDLE,
+    }
+}
+
+/// Make an endpoint. It is owned by the caller, so it dies with the caller and
+/// every capability to it is revoked at that moment.
+fn sys_endpoint() -> i64 {
+    let proc = match caller() {
+        Some(p) => p,
+        None => return E_BADHANDLE,
+    };
+    let mut g = GRAPH.lock();
+    let ep = match g.create_under_process(proc, bramble_graph::body::Endpoint::ZERO) {
+        Ok(e) => e,
+        Err(_) => return E_NOSPACE,
+    };
+    match g.grant(proc, ep, Rights::ALL) {
+        Ok(slot) => slot as i64,
+        Err(_) => E_NOSPACE,
     }
 }
 

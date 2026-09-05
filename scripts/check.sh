@@ -11,17 +11,17 @@ echo "==> clippy"
 cargo kclippy -- -D warnings
 cargo clippy -p bramble-kernel -- -D warnings
 
-WAIT_FOR="${1:-phase 4 complete}"
+WAIT_FOR="${1:-phase 7 complete}"
 
 echo "==> debug kernel, boot smoke test"
 ./scripts/build-iso.sh >/dev/null
-./scripts/smoke.sh --wait-for "$WAIT_FOR" >/dev/null
+./scripts/smoke.sh --wait-for "$WAIT_FOR" --timeout 400 >/dev/null
 
 # The performance gates are only enforced with the optimiser on: unoptimised,
 # a ratio between a layered abstraction and a three-line control measures the
 # optimiser rather than the design.
 echo "==> release kernel, boot smoke test (performance gates enforced)"
 PROFILE=release ./scripts/build-iso.sh >/dev/null
-./scripts/smoke.sh --wait-for "$WAIT_FOR" >/dev/null
+./scripts/smoke.sh --wait-for "$WAIT_FOR" --timeout 400 >/dev/null
 
 echo "all checks passed"

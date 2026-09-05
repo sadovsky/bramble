@@ -288,8 +288,14 @@ extern "C" fn kmain() -> ! {
     println!();
     dump::dump_graph();
 
+    // ---- phase 7: lifecycle from userspace ----
     println!();
-    cprintln!(fb::ACCENT, "phase 6 complete. halting.");
+    selftest::lifecycle(modules);
+    println!();
+    dump::dump_graph();
+
+    println!();
+    cprintln!(fb::ACCENT, "phase 7 complete. halting.");
     halt_forever();
 }
 
