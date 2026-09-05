@@ -109,6 +109,12 @@ impl Prot {
     pub const fn contains(self, o: Prot) -> bool {
         self.0 & o.0 == o.0
     }
+    pub const fn union(self, o: Prot) -> Prot {
+        Prot(self.0 | o.0)
+    }
+    pub const RW: Prot = Prot(Prot::READ.0 | Prot::WRITE.0);
+    pub const RWU: Prot = Prot(Prot::READ.0 | Prot::WRITE.0 | Prot::USER.0);
+    pub const RXU: Prot = Prot(Prot::READ.0 | Prot::EXEC.0 | Prot::USER.0);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

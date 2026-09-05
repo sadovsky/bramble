@@ -13,10 +13,14 @@ mod dump;
 mod fb;
 mod font;
 mod frames;
+mod paging;
 mod print;
+mod reaper;
+mod selftest;
 mod serial;
 mod state;
 mod sync;
+mod vm;
 
 use limine::request::{
     ExecutableCmdlineRequest, FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest,
@@ -204,6 +208,7 @@ extern "C" fn kmain() -> ! {
     // ---- phase 2: physical memory, then the graph itself ----
 
     let hhdm = HHDM.get_response().expect("bootloader gave no hhdm").offset();
+    paging::set_hhdm(hhdm);
     let memmap = MEMORY_MAP.get_response().expect("bootloader gave no memory map");
     let modules: &[&limine::file::File] =
         MODULES.get_response().map(|m| m.modules()).unwrap_or(&[]);
@@ -248,8 +253,14 @@ extern "C" fn kmain() -> ! {
 
     dump::dump_graph();
 
+    // ---- phase 3: address spaces and the page-table invariant ----
     println!();
-    cprintln!(fb::ACCENT, "phase 2 complete. halting.");
+    selftest::address_spaces();
+    println!();
+    dump::dump_graph();
+
+    println!();
+    cprintln!(fb::ACCENT, "phase 3 complete. halting.");
     halt_forever();
 }
 

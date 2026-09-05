@@ -34,5 +34,5 @@ pub use edge::{
     Dir, Edge, EdgeAttr, HoldsAttr, MapsAttr, NamedAttr, Prot, RawEdgeData, ReadyAttr, WaitRole,
     WaitingAttr,
 };
-pub use graph::{Graph, GraphError, ReapStep, Ref, Result};
+pub use graph::{Graph, GraphError, Reclaim, ReapStep, Ref, Result};
 pub use id::{compatible, EdgeId, EdgeKind, NodeId, NodeKind};

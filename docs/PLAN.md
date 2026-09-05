@@ -272,6 +272,8 @@ Not part of v1. Listed so the v1 design does not paint itself out of them.
 ## Build log
 
 Recorded as phases land, so the go/no-go gates have real numbers attached.
+`docs/DEVLOG.md` is the companion narrative: the same phases explained from
+first principles, with the concepts, the conventional approach, and what broke.
 
 ### Phase 0: boots to a framebuffer — **done**
 
@@ -397,3 +399,44 @@ cargo kbench                # the fast-path measurements
 `scripts/smoke.sh` writes `build/serial.log`, `build/screen.png` and
 `build/graph.png`. There is no KVM in the usual container, so QEMU runs under
 TCG.
+
+### Phase 3: address spaces and the page-table invariant — **done**
+
+Raw four-level page-table manipulation through the bootloader's direct map, and
+`vm::map` / `vm::unmap` as the only functions in the kernel that write a user
+page-table entry. Each creates or destroys the corresponding `Maps` edge in the
+same operation, and rolls back both halves if either fails.
+
+Invariant I5 is checked in **both** directions on every user address space:
+every edge is backed by the entries it claims, and every entry that exists was
+authorised by some edge. The second direction is the one that catches a leak of
+authority rather than a loss of it, and it is the one a conventional kernel
+structurally cannot check, because it has no central authority on what should
+be mapped.
+
+The milestone runs at every boot as `selftest::address_spaces`, and the build
+fails if any leg misbehaves:
+
+- map four pages, switch address spaces, write through the mapping, and read
+  the bytes back from the physical frame;
+- corrupt a leaf entry by hand: `checker caught it: 0x40000000 wants 0x6000,
+  found 0x106000`;
+- add a valid entry with no edge behind it: `checker caught it at 0x40200000`;
+- unmap, map a different frame at the same address, and read: the new contents,
+  proving the TLB flush is real;
+- destroy everything and compare frame counts: 117778 before, 117778 after,
+  page tables included.
+
+**Deviation from the plan, stated deliberately.** The kernel keeps the
+bootloader's page tables for its own half rather than building fresh ones, and
+records them as two `Maps` edges on a `kernel-space` node. This is I5' from the
+design: the kernel mapping is one fixed thing, immutable after boot, and exempt
+from the checker's walk because verifying a direct map of all of RAM is O(RAM)
+and proves nothing. Every user address space is created by Bramble and checked
+in full. Building our own kernel tables is deferred until it buys something.
+
+**Risk retired:** the derived-index consistency problem, which DESIGN 5.3 named
+as the design's principal bug surface. It is not eliminated — no kernel can
+prevent divergence from hardware it must write by hand — but it is now
+detectable for the whole system by one routine, in both directions, in about
+150 lines. That is the concrete payoff of having a single source of truth.

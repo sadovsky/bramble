@@ -5,8 +5,11 @@ written in `no_std` Rust, whose kernel keeps all of its state in a single
 typed directed graph: processes, memory, devices, capabilities, and wait
 queues are nodes and edges, not separate tables.
 
-Start with the design:
+Start here:
 
+- [`docs/DEVLOG.md`](docs/DEVLOG.md): a running log written for someone who has
+  never built a kernel. Every entry explains the concepts plainly, how the
+  problem is normally solved, what Bramble does instead, and what broke.
 - [`docs/DESIGN.md`](docs/DESIGN.md): the graph representation, the node and
   edge type system, the fast-path analysis and its compromises, what the
   design buys and what it costs, and prior art.
@@ -21,8 +24,9 @@ Start with the design:
 | 0 | Boots to a framebuffer under Limine and OVMF | done |
 | 1 | The graph crate, host-tested and benchmarked | done |
 | 2 | Frame allocator and the boot graph, inspectable | done |
-| 3 | Address spaces and the page-table invariant | next |
-| 4-8 | Threads, userspace, IPC, lifecycle, v1 | planned |
+| 3 | Address spaces, and page tables proven to match the graph | done |
+| 4 | Threads and preemption | next |
+| 5-8 | Userspace, IPC, lifecycle, v1 | planned |
 
 ```
 cargo ktest             # graph crate tests, on the host

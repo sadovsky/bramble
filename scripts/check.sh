@@ -15,6 +15,6 @@ echo "==> kernel build and boot image"
 ./scripts/build-iso.sh >/dev/null
 
 echo "==> boot smoke test"
-./scripts/smoke.sh --wait-for "${1:-phase 2 complete}" >/dev/null
+./scripts/smoke.sh --wait-for "${1:-phase 3 complete}" >/dev/null
 
 echo "all checks passed"

@@ -5,7 +5,8 @@
 //! before the allocator does (DESIGN 3.7).
 
 use bramble_graph::body::*;
-use bramble_graph::checker::{CheckResult, Checker};
+use bramble_graph::edge::{MapsAttr, Prot};
+use bramble_graph::checker::Checker;
 use bramble_graph::graph::{Graph, Ref};
 use bramble_graph::id::NodeId;
 
@@ -15,18 +16,31 @@ use limine::memory_map::{Entry, EntryType};
 use crate::frames::{FrameAllocator, BitmapRegion, FRAME_SIZE};
 use crate::sync::IrqLock;
 
+/// Where the linker script puts the kernel image.
+pub const KERNEL_IMAGE_BASE: u64 = 0xffff_ffff_8000_0000;
+
 pub static GRAPH: IrqLock<Graph> = IrqLock::new(Graph::EMPTY);
 pub static FRAMES: IrqLock<Option<FrameAllocator>> = IrqLock::new(None);
 static CHECKER: IrqLock<Checker> = IrqLock::new(Checker::new());
 
-/// Run the invariant checker against the live graph.
+/// Everything the checker can find wrong: the graph's own invariants, and the
+/// one that needs hardware.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Inconsistency {
+    Graph(bramble_graph::checker::Violation),
+    PageTables(crate::vm::I5),
+}
+
+/// Run every invariant check against the live graph, under one lock hold.
 ///
-/// DESIGN 4.3: this is not optional tooling. In debug builds it runs
-/// periodically; a failure is a panic with a graph dump, not a log line.
-pub fn check_now() -> CheckResult {
+/// DESIGN 4.3: this is not optional tooling. A failure is a panic with a graph
+/// dump, not a log line.
+pub fn check_now() -> Result<(), Inconsistency> {
     let g = GRAPH.lock();
     let mut c = CHECKER.lock();
-    c.check(&g)
+    c.check(&g).map_err(Inconsistency::Graph)?;
+    crate::vm::check_page_tables(&g).map_err(Inconsistency::PageTables)?;
+    Ok(())
 }
 
 /// Panic with a dump if any invariant is broken.
@@ -35,7 +49,7 @@ pub fn assert_consistent(context: &str) {
         crate::println!();
         crate::cprintln!(crate::fb::ALERT, "checker failed during {}: {:?}", context, v);
         crate::dump::dump_graph_best_effort();
-        panic!("graph invariant violated during {}", context);
+        panic!("invariant violated during {}", context);
     }
 }
 
@@ -49,6 +63,8 @@ pub struct BootNodes {
     pub framebuffer: NodeId,
     pub bitmap: NodeId,
     pub kernel_image: NodeId,
+    pub kernel_space: NodeId,
+    pub phys_memory: NodeId,
 }
 
 pub static BOOT: IrqLock<BootNodes> = IrqLock::new(BootNodes {
@@ -58,6 +74,8 @@ pub static BOOT: IrqLock<BootNodes> = IrqLock::new(BootNodes {
     framebuffer: NodeId::NULL,
     bitmap: NodeId::NULL,
     kernel_image: NodeId::NULL,
+    kernel_space: NodeId::NULL,
+    phys_memory: NodeId::NULL,
 });
 
 fn pages_for(bytes: u64) -> u32 {
@@ -75,6 +93,10 @@ pub fn populate(
 ) -> Result<(), bramble_graph::graph::GraphError> {
     let mut g = GRAPH.lock();
     let mut boot = BOOT.lock();
+    let (total_frames, free_frames) = match FRAMES.lock().as_ref() {
+        Some(fa) => (fa.total_frames() as u64, fa.free_frames() as u64),
+        None => (0, 0),
+    };
 
     let root = g.create_root()?;
     boot.root = root.id();
@@ -154,6 +176,57 @@ pub fn populate(
         }
     }
 
+    // The kernel's own address space. Its two mappings are recorded as edges
+    // like any other, but they are exempt from the checker's page-table walk
+    // (invariant I5'): verifying a direct map of all of RAM is O(RAM) and
+    // proves nothing. The tables themselves are the bootloader's, which live in
+    // memory the frame allocator never hands out.
+    let phys = g.create_under_root(
+        root,
+        MemoryObject {
+            phys_base: 0,
+            pages: total_frames as u32,
+            flags: MemFlags::PINNED,
+            ..MemoryObject::ZERO
+        },
+    )?;
+    boot.phys_memory = phys.id();
+    g.link_named(root, phys, "physical-memory")?;
+
+    let kspace = g.create_under_root(
+        root,
+        AddressSpace {
+            pml4_phys: crate::paging::active_pml4(),
+            is_kernel: 1,
+            ..AddressSpace::ZERO
+        },
+    )?;
+    boot.kernel_space = kspace.id();
+    g.link_named(root, kspace, "kernel-space")?;
+    g.link_maps(
+        kspace,
+        phys,
+        MapsAttr {
+            vaddr: crate::paging::hhdm(),
+            len_pages: total_frames as u32,
+            off_pages: 0,
+            prot: Prot::READ.union(Prot::WRITE),
+        },
+    )?;
+    if let Some(img) = g.typed::<MemoryObject>(boot.kernel_image) {
+        let pages = g.body(img).map(|b| b.pages).unwrap_or(0);
+        g.link_maps(
+            kspace,
+            img,
+            MapsAttr {
+                vaddr: KERNEL_IMAGE_BASE,
+                len_pages: pages,
+                off_pages: 0,
+                prot: Prot::READ.union(Prot::WRITE).union(Prot::EXEC),
+            },
+        )?;
+    }
+
     let dev = g.create_under_root(
         root,
         Device { class: DeviceClass::SerialConsole, io_base: serial_io_base, irq: 4, _pad: [0; 3] },
@@ -161,14 +234,12 @@ pub fn populate(
     boot.console = dev.id();
     g.link_named(root, dev, "console")?;
 
-    // Record what the allocator knows, so a snapshot carries the non-graph
+    // Record what the allocator knows, so a dump carries the non-graph
     // register alongside the graph (DESIGN 4.4).
-    if let Some(fa) = FRAMES.lock().as_ref() {
-        let r: Ref<Root> = root;
-        if let Some(b) = g.body_mut(r) {
-            b.total_frames = fa.total_frames() as u64;
-            b.free_frames = fa.free_frames() as u64;
-        }
+    let r: Ref<Root> = root;
+    if let Some(b) = g.body_mut(r) {
+        b.total_frames = total_frames;
+        b.free_frames = free_frames;
     }
     Ok(())
 }

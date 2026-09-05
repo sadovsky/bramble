@@ -280,7 +280,9 @@ fn memory_objects_report_their_frames_when_reaped() {
     loop {
         match g.reap_step() {
             ReapStep::Idle => break,
-            ReapStep::Freed { mem: Some(m), .. } => reclaimed.push(m),
+            ReapStep::Freed { reclaim: Reclaim::Frames { phys, pages, flags }, .. } => {
+                reclaimed.push((phys, pages, flags))
+            }
             _ => {}
         }
     }

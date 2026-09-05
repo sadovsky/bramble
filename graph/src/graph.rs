@@ -140,6 +140,18 @@ impl_store!(MemoryObject, memobjs, NodeKind::MemoryObject);
 impl_store!(Endpoint, endpoints, NodeKind::Endpoint);
 impl_store!(Device, devices, NodeKind::Device);
 
+/// Physical resources a freed node was holding, which only the kernel knows
+/// how to return. The graph reports them; it never touches them itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reclaim {
+    Nothing,
+    /// Frames a memory object described. Device and pinned regions are
+    /// reported too, with their flags, so the caller can decline to free them.
+    Frames { phys: u64, pages: u32, flags: MemFlags },
+    /// The page tables of an address space, root included.
+    PageTables { pml4_phys: u64 },
+}
+
 /// What one call to `reap_step` accomplished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReapStep {
@@ -147,9 +159,9 @@ pub enum ReapStep {
     Idle,
     /// Bounded work was done; call again.
     Progress,
-    /// A node's slot was released. Memory objects report their frames so the
-    /// caller can return them to the frame allocator.
-    Freed { id: NodeId, mem: Option<(u64, u32, MemFlags)> },
+    /// A node's slot was released, along with whatever physical resources it
+    /// was holding.
+    Freed { id: NodeId, reclaim: Reclaim },
     /// A thread's wait was torn down because its target is being destroyed.
     /// The kernel should resume it with an error.
     AbortedWait { thread: NodeId },
@@ -944,11 +956,26 @@ impl Graph {
 
         // Isolated: release the slot.
         let next = self.header(id).unwrap().next_dying;
-        let mem = if id.kind() == Some(NodeKind::MemoryObject) {
-            let r: Ref<MemoryObject> = Ref::from_raw(id);
-            self.body(r).map(|b| (b.phys_base, b.pages, b.flags))
-        } else {
-            None
+        let reclaim = match id.kind() {
+            Some(NodeKind::MemoryObject) => {
+                let r: Ref<MemoryObject> = Ref::from_raw(id);
+                match self.body(r) {
+                    Some(b) => {
+                        Reclaim::Frames { phys: b.phys_base, pages: b.pages, flags: b.flags }
+                    }
+                    None => Reclaim::Nothing,
+                }
+            }
+            Some(NodeKind::AddressSpace) => {
+                let r: Ref<AddressSpace> = Ref::from_raw(id);
+                match self.body(r) {
+                    Some(b) if b.pml4_phys != 0 && b.is_kernel == 0 => {
+                        Reclaim::PageTables { pml4_phys: b.pml4_phys }
+                    }
+                    _ => Reclaim::Nothing,
+                }
+            }
+            _ => Reclaim::Nothing,
         };
         self.dying_head = next;
         if id == self.root_id {
@@ -956,7 +983,7 @@ impl Graph {
         }
         self.free_slot(id);
         self.seq += 1;
-        ReapStep::Freed { id, mem }
+        ReapStep::Freed { id, reclaim }
     }
 
     /// Run the reaper to completion. Convenience for tests and for a quiet
